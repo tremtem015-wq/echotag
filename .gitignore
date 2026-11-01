@@ -1,0 +1,8 @@
+node_modules/
+data/
+.env
+.env.local
+.vercel/
+.secrets/
+*.log
+.DS_Store
