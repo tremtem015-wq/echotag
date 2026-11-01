@@ -1,7 +1,7 @@
 node_modules/
 data/
-.env
-.env.local
+.env*
+!.env.example
 .vercel/
 .secrets/
 *.log
