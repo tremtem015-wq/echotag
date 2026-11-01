@@ -2,6 +2,9 @@
 
 Record a voice note in the browser, get a QR code, and let anyone play it from their phone. No app, no account, no database.
 
+**Live:** https://echotag-vert.vercel.app  
+**Repository:** https://github.com/tremtem015-wq/echotag
+
 The QR code encodes a short link (`/p/<code>`) to a mobile-friendly player. The audio itself lives in storage, not inside the QR code.
 
 ## Run it locally
