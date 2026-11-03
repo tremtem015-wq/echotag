@@ -50,6 +50,7 @@ const CRON_SECRET = process.env.CRON_SECRET || '';
 
 const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || '').trim();
 const ADMIN_PASSWORD_HASH = (process.env.ADMIN_PASSWORD_HASH || '').trim();
+const ADMIN_USERS = (process.env.ADMIN_USERS || '').trim();
 const ADMIN_SESSION_SECRET = (process.env.ADMIN_SESSION_SECRET || '').trim();
 const ADMIN_COOKIE = 'echotag_admin';
 const ADMIN_SESSION_VERSION = 'v1';
@@ -628,20 +629,52 @@ async function verifyPassword(password, stored) {
   return derived.length === parsed.key.length && crypto.timingSafeEqual(derived, parsed.key);
 }
 
+function isUsableAdminUsername(username) {
+  return Boolean(username)
+    && username.length <= 80
+    && !/[\u0000-\u001f\u007f:]/.test(username);
+}
+
+const ADMIN_ACCOUNTS = (() => {
+  const accounts = new Map();
+  const add = (username, hash) => {
+    const name = String(username || '').trim();
+    const value = String(hash || '').trim();
+    if (!isUsableAdminUsername(name) || !parsePasswordHash(value)) return false;
+    if (!accounts.has(name)) {
+      accounts.set(name, {
+        username: name,
+        hash: value,
+        fingerprint: sha256(value).slice(0, 32),
+      });
+    }
+    return true;
+  };
+
+  if (ADMIN_USERNAME || ADMIN_PASSWORD_HASH) add(ADMIN_USERNAME, ADMIN_PASSWORD_HASH);
+  for (const entry of ADMIN_USERS.split(/[\r\n,]+/)) {
+    const separator = entry.indexOf(':');
+    if (separator < 1) continue;
+    add(entry.slice(0, separator), entry.slice(separator + 1));
+  }
+  return accounts;
+})();
+
 const ADMIN_CONFIG_ISSUE = (() => {
-  if (!ADMIN_USERNAME && !ADMIN_PASSWORD_HASH && !ADMIN_SESSION_SECRET) {
+  if (!ADMIN_USERNAME && !ADMIN_PASSWORD_HASH && !ADMIN_USERS && !ADMIN_SESSION_SECRET) {
     return 'Admin is not configured. Set ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET.';
   }
-  if (!ADMIN_USERNAME) return 'ADMIN_USERNAME is missing.';
-  if (ADMIN_USERNAME.length > 80 || /[\u0000-\u001f\u007f]/.test(ADMIN_USERNAME)) {
-    return 'ADMIN_USERNAME is invalid.';
+  if (ADMIN_SESSION_SECRET.length < 32) {
+    return 'ADMIN_SESSION_SECRET must be at least 32 characters.';
   }
-  if (!parsePasswordHash(ADMIN_PASSWORD_HASH)) return 'ADMIN_PASSWORD_HASH is missing or invalid.';
-  if (ADMIN_SESSION_SECRET.length < 32) return 'ADMIN_SESSION_SECRET must be at least 32 characters.';
+  if (ADMIN_ACCOUNTS.size === 0) {
+    return 'No valid admin accounts are configured. Check ADMIN_USERNAME/ADMIN_PASSWORD_HASH and ADMIN_USERS.';
+  }
   return null;
 })();
 const ADMIN_CONFIGURED = ADMIN_CONFIG_ISSUE === null;
-const ADMIN_PASSWORD_FINGERPRINT = sha256(ADMIN_PASSWORD_HASH).slice(0, 32);
+// Used to spend the same scrypt time when a username does not exist.
+const ADMIN_TIMING_HASH = ADMIN_ACCOUNTS.values().next().value?.hash || '';
 
 function parseCookies(req) {
   const header = req.get('cookie') || '';
@@ -684,12 +717,12 @@ function adminHmac(context, value) {
   return crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(`${context}:${value}`).digest('base64url');
 }
 
-function createAdminSession() {
+function createAdminSession(account) {
   const issuedAt = Date.now();
   const payload = {
     v: 1,
-    u: ADMIN_USERNAME,
-    f: ADMIN_PASSWORD_FINGERPRINT,
+    u: account.username,
+    f: account.fingerprint,
     iat: issuedAt,
     exp: issuedAt + ADMIN_SESSION_TTL_MS,
     csrf: crypto.randomBytes(24).toString('base64url'),
@@ -715,8 +748,9 @@ function readAdminSession(req) {
     return null;
   }
 
-  if (!payload || payload.v !== 1 || payload.u !== ADMIN_USERNAME) return null;
-  if (payload.f !== ADMIN_PASSWORD_FINGERPRINT) return null;
+  if (!payload || payload.v !== 1) return null;
+  const account = ADMIN_ACCOUNTS.get(payload.u);
+  if (!account || payload.f !== account.fingerprint) return null;
   if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) return null;
   const now = Date.now();
   if (payload.exp <= now || payload.iat > now + 60_000) return null;
@@ -1203,12 +1237,14 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
 
     const username = typeof body.username === 'string' ? body.username.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const usernameOk = safeEqual(username, ADMIN_USERNAME);
+    const account = typeof username === 'string' && username.length <= 80
+      ? ADMIN_ACCOUNTS.get(username)
+      : undefined;
     const passwordOk = password.length <= 256
-      ? await verifyPassword(password, ADMIN_PASSWORD_HASH)
+      ? await verifyPassword(password, account ? account.hash : ADMIN_TIMING_HASH)
       : false;
 
-    if (!usernameOk || !passwordOk) {
+    if (!account || !passwordOk) {
       console.warn(`Admin sign-in failed from ${req.ip || 'unknown'}`);
       sendAdminPage(res, 401, renderAdminLoginPage({
         csrf: issueAdminLoginCsrf(),
@@ -1218,7 +1254,7 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
     }
 
     loginLimiter.reset(req.ip || 'unknown');
-    const session = createAdminSession();
+    const session = createAdminSession(account);
     res.append('Set-Cookie', adminCookie(req, session.token, Math.floor(ADMIN_SESSION_TTL_MS / 1000)));
     adminRedirect(res, '/admin/dashboard');
   } catch (err) {
