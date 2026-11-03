@@ -48,6 +48,21 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1' || ON_VERCEL;
 const CRON_SECRET = process.env.CRON_SECRET || '';
 
+const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || '').trim();
+const ADMIN_PASSWORD_HASH = (process.env.ADMIN_PASSWORD_HASH || '').trim();
+const ADMIN_SESSION_SECRET = (process.env.ADMIN_SESSION_SECRET || '').trim();
+const ADMIN_COOKIE = 'echotag_admin';
+const ADMIN_SESSION_VERSION = 'v1';
+const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const ADMIN_LOGIN_CSRF_TTL_MS = 30 * 60 * 1000;
+const ADMIN_LOGIN_LIMIT = 8;
+const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const SCRYPT_N = 16384;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_KEYLEN = 64;
+const SCRYPT_MAXMEM = 64 * 1024 * 1024;
+
 const DATA_DIR = path.join(__dirname, 'data', 'recordings');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const APP_URL_PATH = __dirname;
@@ -244,9 +259,12 @@ function fallbackPeaks(code) {
 /* Storage                                                             */
 /* ------------------------------------------------------------------ */
 
+function extensionFor(meta) {
+  return ALLOWED_EXTS.has(meta.ext) ? meta.ext : AUDIO_MIME_EXT[meta.mime] || '.webm';
+}
+
 function audioPathFor(meta) {
-  const ext = ALLOWED_EXTS.has(meta.ext) ? meta.ext : AUDIO_MIME_EXT[meta.mime] || '.webm';
-  return path.join(DATA_DIR, `${meta.code}${ext}`);
+  return path.join(DATA_DIR, `${meta.code}${extensionFor(meta)}`);
 }
 
 function blobMetaPathname(code) {
@@ -254,8 +272,7 @@ function blobMetaPathname(code) {
 }
 
 function blobAudioPathname(meta) {
-  const ext = ALLOWED_EXTS.has(meta.ext) ? meta.ext : AUDIO_MIME_EXT[meta.mime] || '.webm';
-  return `${BLOB_AUDIO_PREFIX}${meta.code}${ext}`;
+  return `${BLOB_AUDIO_PREFIX}${meta.code}${extensionFor(meta)}`;
 }
 
 function isBlobMissing(err) {
@@ -296,6 +313,77 @@ async function readMeta(code) {
   } catch {
     return null;
   }
+}
+
+function compareRecordings(a, b) {
+  const left = Date.parse(a.createdAt) || 0;
+  const right = Date.parse(b.createdAt) || 0;
+  if (right !== left) return right - left;
+  return String(a.code).localeCompare(String(b.code));
+}
+
+async function listRecordingsFromBlob() {
+  const recordings = [];
+  let cursor;
+
+  do {
+    const page = await list({
+      prefix: BLOB_META_PREFIX,
+      cursor,
+      limit: 1000,
+      token: BLOB_TOKEN,
+    });
+
+    const sidecars = page.blobs.filter((blob) => blob.pathname.endsWith('.json'));
+    for (let index = 0; index < sidecars.length; index += 8) {
+      const batch = sidecars.slice(index, index + 8);
+      const results = await Promise.allSettled(batch.map(async (blob) => {
+        const code = blob.pathname.slice(BLOB_META_PREFIX.length, -'.json'.length);
+        if (!CODE_PATTERN.test(code)) return null;
+        const response = await fetch(blob.url, { cache: 'no-store' });
+        if (!response.ok) return null;
+        return parseMeta(await response.json(), code);
+      }));
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) recordings.push(result.value);
+      }
+    }
+
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+
+  return recordings.sort(compareRecordings);
+}
+
+async function listRecordingsFromDisk() {
+  let names;
+  try {
+    names = await fsp.readdir(DATA_DIR);
+  } catch {
+    return [];
+  }
+
+  const recordings = [];
+  await Promise.all(names.map(async (name) => {
+    if (!name.endsWith('.json')) return;
+    const code = name.slice(0, -'.json'.length);
+    if (!CODE_PATTERN.test(code)) return;
+    try {
+      const raw = await fsp.readFile(path.join(DATA_DIR, name), 'utf8');
+      const meta = parseMeta(JSON.parse(raw), code);
+      if (meta) recordings.push(meta);
+    } catch {
+      // Ignore unreadable sidecars; they cannot be managed safely.
+    }
+  }));
+
+  return recordings.sort(compareRecordings);
+}
+
+async function listRecordings() {
+  if (STORAGE_MODE === 'unavailable') return [];
+  if (STORAGE_MODE === 'blob') return listRecordingsFromBlob();
+  return listRecordingsFromDisk();
 }
 
 async function getPlayableRecording(code) {
@@ -464,7 +552,7 @@ async function sweepExpired() {
 /* Rate limiting (lightweight, per IP)                                 */
 /* ------------------------------------------------------------------ */
 
-function createLimiter({ limit, windowMs, message }) {
+function createLimiter({ limit, windowMs, message, onLimit }) {
   const buckets = new Map();
   const timer = setInterval(() => {
     const now = Date.now();
@@ -474,7 +562,7 @@ function createLimiter({ limit, windowMs, message }) {
   }, windowMs);
   timer.unref();
 
-  return (req, res, next) => {
+  function limiter(req, res, next) {
     const key = req.ip || 'unknown';
     const now = Date.now();
     let bucket = buckets.get(key);
@@ -485,16 +573,306 @@ function createLimiter({ limit, windowMs, message }) {
     bucket.count += 1;
     if (bucket.count > limit) {
       res.set('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
+      if (typeof onLimit === 'function') return onLimit(req, res, message);
       return res.status(429).json({ error: message });
     }
     return next();
-  };
+  }
+
+  limiter.reset = (key) => buckets.delete(key);
+  return limiter;
 }
 
 const uploadLimiter = createLimiter({
   limit: 30,
   windowMs: 10 * 60 * 1000,
   message: 'Too many recordings from this device. Please wait a few minutes.',
+});
+
+/* ------------------------------------------------------------------ */
+/* Admin authentication                                                */
+/* ------------------------------------------------------------------ */
+
+function parsePasswordHash(stored) {
+  const match = /^scrypt\$(\d+)\$(\d+)\$(\d+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$/.exec(
+    String(stored || ''),
+  );
+  if (!match) return null;
+
+  const N = Number(match[1]);
+  const r = Number(match[2]);
+  const p = Number(match[3]);
+  if (N !== SCRYPT_N || r !== SCRYPT_R || p !== SCRYPT_P) return null;
+
+  const salt = Buffer.from(match[4], 'base64url');
+  const key = Buffer.from(match[5], 'base64url');
+  if (salt.length < 16 || key.length < 32 || key.length > SCRYPT_KEYLEN) return null;
+
+  return { N, r, p, salt, key };
+}
+
+async function verifyPassword(password, stored) {
+  const parsed = parsePasswordHash(stored);
+  if (!parsed) return false;
+
+  const derived = await new Promise((resolve, reject) => {
+    crypto.scrypt(
+      Buffer.from(String(password), 'utf8'),
+      parsed.salt,
+      parsed.key.length,
+      { N: parsed.N, r: parsed.r, p: parsed.p, maxmem: SCRYPT_MAXMEM },
+      (err, key) => (err ? reject(err) : resolve(key)),
+    );
+  });
+
+  return derived.length === parsed.key.length && crypto.timingSafeEqual(derived, parsed.key);
+}
+
+const ADMIN_CONFIG_ISSUE = (() => {
+  if (!ADMIN_USERNAME && !ADMIN_PASSWORD_HASH && !ADMIN_SESSION_SECRET) {
+    return 'Admin is not configured. Set ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET.';
+  }
+  if (!ADMIN_USERNAME) return 'ADMIN_USERNAME is missing.';
+  if (ADMIN_USERNAME.length > 80 || /[\u0000-\u001f\u007f]/.test(ADMIN_USERNAME)) {
+    return 'ADMIN_USERNAME is invalid.';
+  }
+  if (!parsePasswordHash(ADMIN_PASSWORD_HASH)) return 'ADMIN_PASSWORD_HASH is missing or invalid.';
+  if (ADMIN_SESSION_SECRET.length < 32) return 'ADMIN_SESSION_SECRET must be at least 32 characters.';
+  return null;
+})();
+const ADMIN_CONFIGURED = ADMIN_CONFIG_ISSUE === null;
+const ADMIN_PASSWORD_FINGERPRINT = sha256(ADMIN_PASSWORD_HASH).slice(0, 32);
+
+function parseCookies(req) {
+  const header = req.get('cookie') || '';
+  const cookies = Object.create(null);
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    if (!name) continue;
+    let value = part.slice(separator + 1).trim();
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // Keep the raw value if it is not valid percent-encoding.
+    }
+    cookies[name] = value;
+  }
+  return cookies;
+}
+
+function requestIsSecure(req) {
+  if (req.secure) return true;
+  const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  return forwardedProto === 'https';
+}
+
+function adminCookie(req, value, maxAgeSeconds) {
+  const parts = [
+    `${ADMIN_COOKIE}=${value}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (requestIsSecure(req)) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function adminHmac(context, value) {
+  return crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(`${context}:${value}`).digest('base64url');
+}
+
+function createAdminSession() {
+  const issuedAt = Date.now();
+  const payload = {
+    v: 1,
+    u: ADMIN_USERNAME,
+    f: ADMIN_PASSWORD_FINGERPRINT,
+    iat: issuedAt,
+    exp: issuedAt + ADMIN_SESSION_TTL_MS,
+    csrf: crypto.randomBytes(24).toString('base64url'),
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = adminHmac('session-v1', body);
+  return { token: `${ADMIN_SESSION_VERSION}.${body}.${signature}`, payload };
+}
+
+function readAdminSession(req) {
+  if (!ADMIN_CONFIGURED) return null;
+  const token = parseCookies(req)[ADMIN_COOKIE];
+  if (!token) return null;
+
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts[0] !== ADMIN_SESSION_VERSION) return null;
+  if (!safeEqual(parts[2], adminHmac('session-v1', parts[1]))) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+
+  if (!payload || payload.v !== 1 || payload.u !== ADMIN_USERNAME) return null;
+  if (payload.f !== ADMIN_PASSWORD_FINGERPRINT) return null;
+  if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) return null;
+  const now = Date.now();
+  if (payload.exp <= now || payload.iat > now + 60_000) return null;
+  if (payload.exp - payload.iat > ADMIN_SESSION_TTL_MS + 60_000) return null;
+  if (typeof payload.csrf !== 'string' || payload.csrf.length < 20) return null;
+  return payload;
+}
+
+function issueAdminLoginCsrf() {
+  const issuedAt = Date.now();
+  const nonce = crypto.randomBytes(18).toString('base64url');
+  const body = `${issuedAt}.${nonce}`;
+  return `${body}.${adminHmac('login-v1', body)}`;
+}
+
+function verifyAdminLoginCsrf(token) {
+  if (typeof token !== 'string' || token.length > 300) return false;
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+
+  const issuedAt = Number(parts[0]);
+  if (!Number.isFinite(issuedAt)) return false;
+  const now = Date.now();
+  if (issuedAt > now + 60_000 || now - issuedAt > ADMIN_LOGIN_CSRF_TTL_MS) return false;
+  if (!/^[A-Za-z0-9_-]{20,64}$/.test(parts[1])) return false;
+  return safeEqual(parts[2], adminHmac('login-v1', `${parts[0]}.${parts[1]}`));
+}
+
+function isSameOriginRequest(req) {
+  const fetchSite = req.get('sec-fetch-site');
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
+
+  const origin = req.get('origin');
+  if (!origin) return true;
+  const candidate = normalizeBase(origin);
+  if (!candidate) return false;
+
+  const expected = normalizeBase(requestOrigin(req));
+  if (expected && candidate === expected) return true;
+  const envBase = normalizeBase(PUBLIC_BASE_URL);
+  return Boolean(envBase && candidate === envBase);
+}
+
+function mediaOriginsFor(recordings) {
+  const origins = new Set();
+  for (const meta of recordings) {
+    if (!meta.audioUrl) continue;
+    try {
+      const url = new URL(meta.audioUrl);
+      if (url.protocol === 'https:' || url.protocol === 'http:') origins.add(url.origin);
+    } catch {
+      // Ignore malformed legacy URLs.
+    }
+  }
+  return [...origins];
+}
+
+function adminContentSecurityPolicy(mediaOrigins = []) {
+  const media = ["'self'", ...mediaOrigins].join(' ');
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+    "img-src 'self' data:",
+    "style-src 'self'",
+    "script-src 'self'",
+    `media-src ${media}`,
+    "connect-src 'self'",
+    "font-src 'self'",
+  ].join('; ');
+}
+
+function sendAdminPage(res, status, html, mediaOrigins = []) {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'X-Frame-Options': 'DENY',
+    'X-Robots-Tag': 'noindex, nofollow, noarchive',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Content-Security-Policy': adminContentSecurityPolicy(mediaOrigins),
+  });
+  res.status(status).type('html').send(html);
+}
+
+function adminRedirect(res, location) {
+  res.set('Cache-Control', 'no-store');
+  res.redirect(303, location);
+}
+
+function requireAdminConfigured(req, res, next) {
+  if (!ADMIN_CONFIGURED) {
+    sendAdminPage(res, 503, renderAdminErrorPage(
+      'Admin is not configured',
+      'This deployment has no admin credentials yet. Add ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET, then redeploy.',
+      '/',
+      'Back to EchoTag',
+    ));
+    return;
+  }
+  next();
+}
+
+function requireAdminSession(req, res, next) {
+  const session = readAdminSession(req);
+  if (!session) {
+    res.redirect(303, '/admin');
+    return;
+  }
+  req.adminSession = session;
+  next();
+}
+
+function requireAdminCsrf(req, res, next) {
+  if (!isSameOriginRequest(req)) {
+    sendAdminPage(res, 403, renderAdminErrorPage(
+      'Request blocked',
+      'The request did not come from this site. Reload the console and try again.',
+      '/admin',
+      'Back to the console',
+    ));
+    return;
+  }
+
+  const supplied = String(
+    req.get('x-csrf-token') || (req.body && req.body._csrf) || '',
+  ).trim();
+  if (!supplied || !safeEqual(supplied, req.adminSession.csrf)) {
+    sendAdminPage(res, 403, renderAdminErrorPage(
+      'Request blocked',
+      'Your security token was missing or out of date. Reload the console and try again.',
+      '/admin',
+      'Back to the console',
+    ));
+    return;
+  }
+  next();
+}
+
+const adminForm = express.urlencoded({ extended: false, limit: '16kb' });
+
+const loginLimiter = createLimiter({
+  limit: ADMIN_LOGIN_LIMIT,
+  windowMs: ADMIN_LOGIN_WINDOW_MS,
+  message: 'Too many sign-in attempts. Wait 15 minutes, then try again.',
+  onLimit(req, res, message) {
+    sendAdminPage(res, 429, renderAdminErrorPage(
+      'Too many attempts',
+      message,
+      '/admin',
+      'Try again later',
+    ));
+  },
 });
 
 /* ------------------------------------------------------------------ */
@@ -512,6 +890,80 @@ const upload = multer({
     callback(null, true);
   },
 });
+
+async function streamLocalAudio(req, res, next, meta, cacheControl) {
+  let stat;
+  try {
+    stat = await fsp.stat(audioPathFor(meta));
+  } catch {
+    next(httpError(404, 'Recording not found.'));
+    return;
+  }
+
+  if (!stat.isFile() || stat.size === 0) {
+    next(httpError(404, 'Recording not found.'));
+    return;
+  }
+
+  const size = stat.size;
+  const ext = extensionFor(meta);
+  const baseHeaders = {
+    'Content-Type': meta.mime,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': cacheControl,
+    'Content-Disposition': `inline; filename="${APP_NAME.toLowerCase()}-${meta.code}${ext}"`,
+  };
+
+  const rangeHeader = req.get('range');
+  if (rangeHeader) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+    if (!match || (match[1] === '' && match[2] === '')) {
+      res.set('Content-Range', `bytes */${size}`).status(416).end();
+      return;
+    }
+    let start;
+    let end;
+    if (match[1] === '') {
+      const suffixLength = Number(match[2]);
+      if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+        res.set('Content-Range', `bytes */${size}`).status(416).end();
+        return;
+      }
+      start = Math.max(0, size - suffixLength);
+      end = size - 1;
+    } else {
+      start = Number(match[1]);
+      end = match[2] === '' ? size - 1 : Number(match[2]);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+      res.set('Content-Range', `bytes */${size}`).status(416).end();
+      return;
+    }
+    end = Math.min(end, size - 1);
+    res.status(206).set({
+      ...baseHeaders,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Content-Length': String(end - start + 1),
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    fs.createReadStream(audioPathFor(meta), { start, end })
+      .on('error', next)
+      .pipe(res);
+    return;
+  }
+
+  res.status(200).set({ ...baseHeaders, 'Content-Length': String(size) });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  fs.createReadStream(audioPathFor(meta))
+    .on('error', next)
+    .pipe(res);
+}
 
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
@@ -686,65 +1138,7 @@ app.get('/media/:code', async (req, res, next) => {
       return;
     }
 
-    const filePath = audioPathFor(meta);
-    const stat = await fsp.stat(filePath);
-    const size = stat.size;
-    const baseHeaders = {
-      'Content-Type': meta.mime,
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=31536000, immutable',
-      'Content-Disposition': `inline; filename="${APP_NAME.toLowerCase()}-${meta.code}${meta.ext}"`,
-    };
-
-    const rangeHeader = req.get('range');
-    if (rangeHeader) {
-      const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-      if (!match || (match[1] === '' && match[2] === '')) {
-        res.set('Content-Range', `bytes */${size}`).status(416).end();
-        return;
-      }
-      let start;
-      let end;
-      if (match[1] === '') {
-        const suffixLength = Number(match[2]);
-        if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
-          res.set('Content-Range', `bytes */${size}`).status(416).end();
-          return;
-        }
-        start = Math.max(0, size - suffixLength);
-        end = size - 1;
-      } else {
-        start = Number(match[1]);
-        end = match[2] === '' ? size - 1 : Number(match[2]);
-      }
-      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
-        res.set('Content-Range', `bytes */${size}`).status(416).end();
-        return;
-      }
-      end = Math.min(end, size - 1);
-      res.status(206).set({
-        ...baseHeaders,
-        'Content-Range': `bytes ${start}-${end}/${size}`,
-        'Content-Length': String(end - start + 1),
-      });
-      if (req.method === 'HEAD') {
-        res.end();
-        return;
-      }
-      fs.createReadStream(filePath, { start, end })
-        .on('error', next)
-        .pipe(res);
-      return;
-    }
-
-    res.status(200).set({ ...baseHeaders, 'Content-Length': String(size) });
-    if (req.method === 'HEAD') {
-      res.end();
-      return;
-    }
-    fs.createReadStream(filePath)
-      .on('error', next)
-      .pipe(res);
+    await streamLocalAudio(req, res, next, meta, 'public, max-age=31536000, immutable');
   } catch (err) {
     next(err);
   }
@@ -769,6 +1163,175 @@ app.get('/api/cron/sweep', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+/* ------------------------------------------------------------------ */
+/* Admin routes                                                       */
+/* ------------------------------------------------------------------ */
+
+app.get('/admin', requireAdminConfigured, (req, res) => {
+  if (readAdminSession(req)) {
+    adminRedirect(res, '/admin/dashboard');
+    return;
+  }
+  sendAdminPage(res, 200, renderAdminLoginPage({
+    csrf: issueAdminLoginCsrf(),
+    error: '',
+  }));
+});
+
+app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async (req, res, next) => {
+  try {
+    if (!isSameOriginRequest(req)) {
+      sendAdminPage(res, 403, renderAdminErrorPage(
+        'Request blocked',
+        'The sign-in request did not come from this site. Reload the page and try again.',
+        '/admin',
+        'Back to sign in',
+      ));
+      return;
+    }
+
+    const body = req.body || {};
+    if (!verifyAdminLoginCsrf(body._csrf)) {
+      sendAdminPage(res, 400, renderAdminLoginPage({
+        csrf: issueAdminLoginCsrf(),
+        error: 'That sign-in form expired. Please try again.',
+      }));
+      return;
+    }
+
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+    const usernameOk = safeEqual(username, ADMIN_USERNAME);
+    const passwordOk = password.length <= 256
+      ? await verifyPassword(password, ADMIN_PASSWORD_HASH)
+      : false;
+
+    if (!usernameOk || !passwordOk) {
+      console.warn(`Admin sign-in failed from ${req.ip || 'unknown'}`);
+      sendAdminPage(res, 401, renderAdminLoginPage({
+        csrf: issueAdminLoginCsrf(),
+        error: 'Incorrect username or password.',
+      }));
+      return;
+    }
+
+    loginLimiter.reset(req.ip || 'unknown');
+    const session = createAdminSession();
+    res.append('Set-Cookie', adminCookie(req, session.token, Math.floor(ADMIN_SESSION_TTL_MS / 1000)));
+    adminRedirect(res, '/admin/dashboard');
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/logout', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, (req, res) => {
+  res.append('Set-Cookie', adminCookie(req, '', 0));
+  adminRedirect(res, '/admin');
+});
+
+app.get('/admin/dashboard', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    let recordings = [];
+    let listError = '';
+
+    if (STORAGE_MODE === 'unavailable') {
+      listError = 'Storage is not connected on this deployment, so recordings cannot be listed.';
+    } else {
+      try {
+        recordings = await listRecordings();
+      } catch (err) {
+        console.error('Could not list recordings:', err);
+        listError = 'Recordings could not be loaded right now. Refresh to try again.';
+      }
+    }
+
+    const status = ['deleted', 'missing', 'error'].includes(String(req.query.status || ''))
+      ? String(req.query.status)
+      : '';
+    const storageLabel = STORAGE_MODE === 'blob'
+      ? 'Vercel Blob'
+      : STORAGE_MODE === 'file'
+        ? 'Local disk'
+        : 'Not connected';
+
+    sendAdminPage(res, 200, renderAdminDashboard({
+      recordings,
+      csrf: req.adminSession.csrf,
+      status,
+      listError,
+      storageLabel,
+    }), mediaOriginsFor(recordings));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/admin/audio/:code', requireAdminConfigured, async (req, res, next) => {
+  try {
+    if (!readAdminSession(req)) {
+      res.set('Cache-Control', 'private, no-store').status(401).type('text/plain').send('Sign in to listen.');
+      return;
+    }
+
+    const code = String(req.params.code);
+    if (!CODE_PATTERN.test(code)) throw httpError(404, 'Recording not found.');
+    const meta = await readMeta(code);
+    if (!meta) throw httpError(404, 'Recording not found.');
+    if (STORAGE_MODE === 'unavailable') throw httpError(503, 'Storage is not connected.');
+
+    res.set('Cache-Control', 'private, no-store');
+    if (STORAGE_MODE === 'blob') {
+      if (!meta.audioUrl) throw httpError(404, 'Recording not found.');
+      let audioUrl;
+      try {
+        audioUrl = new URL(meta.audioUrl);
+      } catch {
+        throw httpError(404, 'Recording not found.');
+      }
+      if (audioUrl.protocol !== 'https:' && audioUrl.protocol !== 'http:') {
+        throw httpError(404, 'Recording not found.');
+      }
+      res.redirect(302, audioUrl.toString());
+      return;
+    }
+
+    await streamLocalAudio(req, res, next, meta, 'private, no-store');
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/recordings/:code/delete', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const code = String(req.params.code);
+    if (!CODE_PATTERN.test(code)) {
+      adminRedirect(res, '/admin/dashboard?status=missing');
+      return;
+    }
+
+    const meta = await readMeta(code);
+    if (!meta) {
+      adminRedirect(res, '/admin/dashboard?status=missing');
+      return;
+    }
+
+    await removeRecording(meta);
+    adminRedirect(res, '/admin/dashboard?status=deleted');
+  } catch (err) {
+    console.error('Admin delete failed:', err);
+    adminRedirect(res, '/admin/dashboard?status=error');
+  }
+});
+
+app.use('/admin', (req, res) => {
+  sendAdminPage(res, 404, renderAdminErrorPage(
+    'Admin page not found',
+    'That page does not exist in the admin console.',
+    '/admin',
+    'Back to the console',
+  ));
 });
 
 app.use(express.static(PUBLIC_DIR, { index: 'index.html', maxAge: 0 }));
@@ -799,6 +1362,21 @@ app.use((err, req, res, next) => {
   if (status >= 500) console.error(err);
   if (req.path.startsWith('/api/')) {
     res.status(status).json({ error: status >= 500 ? 'Something went wrong on the server.' : err.message });
+    return;
+  }
+  if (req.path.startsWith('/admin/audio/')) {
+    res.status(status).type('text/plain').send(status >= 500 ? 'Playback failed.' : 'Recording not found.');
+    return;
+  }
+  if (req.path === '/admin' || req.path.startsWith('/admin/')) {
+    sendAdminPage(res, status, renderAdminErrorPage(
+      status === 404 ? 'Admin page not found' : 'Something went wrong',
+      status === 404
+        ? 'That page does not exist in the admin console.'
+        : 'The admin console hit an unexpected problem. Reload and try again.',
+      '/admin',
+      'Back to the console',
+    ));
     return;
   }
   res.status(status).type('html').send(renderErrorPage(
@@ -917,6 +1495,7 @@ function renderPlayPage(meta, req) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </a>
     </footer>
+    <p class="play-copyright">© Sinsana Studio 2026 · All rights reserved.</p>
 
     <noscript>
       <p class="noscript">JavaScript is off, but you can still listen below.</p>
@@ -964,7 +1543,263 @@ function renderErrorPage(title, message) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </a>
     </div>
+    <p class="error-copyright">© Sinsana Studio 2026 · All rights reserved.</p>
   </main>
+</body>
+</html>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Admin views                                                        */
+/* ------------------------------------------------------------------ */
+
+function formatDateTime(isoDate) {
+  const date = new Date(isoDate);
+  if (Number.isNaN(date.getTime())) return 'Unknown date';
+  return new Intl.DateTimeFormat('en', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  const amount = value / (1024 ** index);
+  return `${amount >= 10 || index === 0 ? Math.round(amount) : amount.toFixed(1)} ${units[index]}`;
+}
+
+function renderAdminErrorPage(title, message, backHref = '/admin', backLabel = 'Back to the console') {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>${escapeHtml(title)} · ${APP_NAME} admin</title>
+  <meta name="theme-color" content="#08080d">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <div class="admin-aurora" aria-hidden="true"><span></span><span></span></div>
+  <main class="login-shell">
+    <header class="admin-header">
+      <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
+      <span class="header-note">Private console</span>
+    </header>
+    <section class="login-card admin-error-card">
+      <div class="login-orb login-orb-error" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+          <path d="M12 8v5M12 16h.01"/>
+          <path d="M10.3 3.8 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0Z"/>
+        </svg>
+      </div>
+      <p class="eyebrow">Admin console</p>
+      <h1>${escapeHtml(title)}</h1>
+      <p class="login-copy">${escapeHtml(message)}</p>
+      <a class="button ghost" href="${escapeHtml(backHref)}">${escapeHtml(backLabel)}</a>
+    </section>
+    <footer class="admin-footer">
+      <p>© Sinsana Studio 2026 · All rights reserved.</p>
+      <p><a href="/">EchoTag home</a></p>
+    </footer>
+  </main>
+</body>
+</html>`;
+}
+
+function renderAdminLoginPage({ csrf, error }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sign in · ${APP_NAME} admin</title>
+  <meta name="description" content="Private EchoTag admin console.">
+  <meta name="theme-color" content="#08080d">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <div class="admin-aurora" aria-hidden="true"><span></span><span></span></div>
+  <main class="login-shell">
+    <header class="admin-header">
+      <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
+      <span class="header-note">Private console</span>
+    </header>
+
+    <section class="login-card">
+      <div class="login-orb" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3 4.5 6v5.4c0 4.5 3.1 7.7 7.5 9.6 4.4-1.9 7.5-5.1 7.5-9.6V6L12 3Z"/>
+          <path d="m9 12 2 2 4-4"/>
+        </svg>
+      </div>
+      <p class="eyebrow">Sinsana Studio · Admin</p>
+      <h1>Welcome back.</h1>
+      <p class="login-copy">Sign in to listen to and manage every voice note stored on this server.</p>
+
+      ${error ? `<p class="alert alert-error" role="alert">${escapeHtml(error)}</p>` : ''}
+
+      <form class="login-form" method="post" action="/admin/login">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <label class="field">
+          <span>Username</span>
+          <input type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="80" required autofocus>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" maxlength="256" required>
+        </label>
+        <button class="button primary" type="submit">Sign in</button>
+      </form>
+
+      <p class="login-foot">Authorized users only. Sessions expire after 8 hours, and repeated failures are rate-limited.</p>
+    </section>
+
+    <footer class="admin-footer">
+      <p>© Sinsana Studio 2026 · All rights reserved.</p>
+      <p><a href="/">Back to EchoTag</a></p>
+    </footer>
+  </main>
+</body>
+</html>`;
+}
+
+function renderAdminRecordingRow(meta, csrf) {
+  const code = String(meta.code);
+  const title = meta.title || 'Voice note';
+  const expired = Boolean(meta.expiresAt && Date.parse(meta.expiresAt) <= Date.now());
+  const duration = meta.duration ? formatDuration(meta.duration) : '—';
+  const size = formatBytes(meta.size);
+  const created = formatDateTime(meta.createdAt);
+  const expiry = meta.expiresAt
+    ? `${expired ? 'Expired' : 'Expires'} ${formatDate(meta.expiresAt)}`
+    : 'No expiry';
+  const search = escapeHtml(`${title} ${code}`.toLowerCase());
+  const confirmText = `Delete &quot;${escapeHtml(title)}&quot;? This permanently removes the audio and cannot be undone.`;
+
+  return `<article class="recording" data-search="${search}">
+    <div class="recording-main">
+      <div class="recording-top">
+        <h3 class="recording-title">${escapeHtml(title)}</h3>
+        <span class="badge ${expired ? 'badge-expired' : 'badge-active'}">${expired ? 'Expired' : 'Active'}</span>
+      </div>
+      <p class="recording-meta">
+        <span class="code-pill">${escapeHtml(code)}</span>
+        <span>${escapeHtml(created)}</span>
+        <span>${escapeHtml(duration)}</span>
+        <span>${escapeHtml(size)}</span>
+        <span>${escapeHtml(expiry)}</span>
+      </p>
+      <audio controls preload="none" src="/admin/audio/${encodeURIComponent(code)}"></audio>
+    </div>
+    <div class="recording-actions">
+      <a class="button ghost small" href="/p/${encodeURIComponent(code)}" target="_blank" rel="noopener">Open player</a>
+      <form method="post" action="/admin/recordings/${encodeURIComponent(code)}/delete" data-confirm="${confirmText}">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <button class="button danger small" type="submit">Delete</button>
+      </form>
+    </div>
+  </article>`;
+}
+
+function renderAdminDashboard({ recordings, csrf, status, listError, storageLabel }) {
+  const now = Date.now();
+  const active = recordings.filter((meta) => !(meta.expiresAt && Date.parse(meta.expiresAt) <= now)).length;
+  const totalBytes = recordings.reduce((sum, meta) => sum + (Number(meta.size) || 0), 0);
+  const totalDuration = recordings.reduce((sum, meta) => sum + (Number(meta.duration) || 0), 0);
+  const rows = recordings.map((meta) => renderAdminRecordingRow(meta, csrf)).join('');
+
+  const statusMessages = {
+    deleted: 'The recording was deleted.',
+    missing: 'That recording was already gone.',
+    error: 'The recording could not be deleted. Please try again.',
+  };
+  const statusHtml = status && statusMessages[status]
+    ? `<p class="alert ${status === 'deleted' ? 'alert-ok' : 'alert-warn'}" role="status">${escapeHtml(statusMessages[status])}</p>`
+    : '';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Recordings · ${APP_NAME} admin</title>
+  <meta name="description" content="Private EchoTag admin console.">
+  <meta name="theme-color" content="#08080d">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <div class="admin-aurora" aria-hidden="true"><span></span><span></span></div>
+  <header class="admin-header admin-header-wide">
+    <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
+    <div class="admin-header-actions">
+      <span class="header-note">Private console</span>
+      <a class="button ghost small" href="/admin/dashboard">Refresh</a>
+      <form class="inline-form" method="post" action="/admin/logout">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <button class="button ghost small" type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+
+  <main class="admin-shell">
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Admin console</p>
+      <h1>Every voice note.</h1>
+      <p class="hero-copy">Listen to any recording stored on this server, or remove it permanently. Storage: <strong>${escapeHtml(storageLabel)}</strong>.</p>
+      <div class="stats">
+        <div class="stat"><span>Total notes</span><strong>${recordings.length}</strong></div>
+        <div class="stat"><span>Active</span><strong>${active}</strong></div>
+        <div class="stat"><span>Audio</span><strong>${escapeHtml(formatBytes(totalBytes))}</strong></div>
+        <div class="stat"><span>Play time</span><strong>${escapeHtml(formatDuration(totalDuration))}</strong></div>
+      </div>
+    </section>
+
+    ${statusHtml}
+    ${listError ? `<p class="alert alert-warn" role="alert">${escapeHtml(listError)}</p>` : ''}
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Recordings</h2>
+          <p id="visibleCount" data-total="${recordings.length}">${recordings.length} ${recordings.length === 1 ? 'note' : 'notes'}</p>
+        </div>
+        <label class="search">
+          <span class="sr-only">Search recordings</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="adminSearch" type="search" placeholder="Search title or code" autocomplete="off">
+        </label>
+      </div>
+
+      <div class="recording-list" id="recordingList">
+        ${rows || `<div class="empty-state">
+          <div class="empty-orb" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 3v10M8 7v4M16 7v4M5 13a7 7 0 0 0 14 0M12 20v1"/></svg>
+          </div>
+          <h3>No recordings yet</h3>
+          <p>New voice notes will appear here as soon as someone records one.</p>
+          <a class="button ghost small" href="/">Open the recorder</a>
+        </div>`}
+      </div>
+    </section>
+
+    <footer class="admin-footer">
+      <p>© Sinsana Studio 2026 · All rights reserved.</p>
+      <p><a href="/">EchoTag home</a></p>
+    </footer>
+  </main>
+  <script src="/admin.js" defer></script>
 </body>
 </html>`;
 }
@@ -1015,6 +1850,11 @@ function startLocalServer() {
         : path.relative(APP_URL_PATH, DATA_DIR);
     console.log(`  Storage:  ${storageLabel}`);
     console.log(`  Retain:   ${RETENTION_DAYS > 0 ? `${RETENTION_DAYS} days` : 'until deleted'}`);
+    if (ADMIN_CONFIGURED) {
+      console.log(`  Admin:    http://localhost:${activePort}/admin`);
+    } else {
+      console.log(`  Admin:    disabled (${ADMIN_CONFIG_ISSUE})`);
+    }
     console.log('');
   });
 

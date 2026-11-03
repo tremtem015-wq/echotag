@@ -1207,6 +1207,14 @@ body.on-localhost .lan-tip {
   font-weight: 600;
 }
 
+.site-footer .copyright {
+  flex-basis: 100%;
+  margin-top: 6px;
+  color: var(--faint);
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+
 .toast {
   position: fixed;
   left: 50%;

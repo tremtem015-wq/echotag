@@ -555,6 +555,20 @@ body.is-playing .play-button .icon-pause {
   font-size: 11.5px;
 }
 
+.play-copyright,
+.error-copyright {
+  margin: 14px 0 0;
+  color: var(--faint);
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+  text-align: center;
+}
+
+.error-copyright {
+  margin-top: auto;
+  padding-top: 22px;
+}
+
 .cta {
   display: inline-flex;
   align-items: center;

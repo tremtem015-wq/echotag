@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "deploy": "vercel --prod"
+    "deploy": "vercel --prod",
+    "admin:credentials": "node scripts/generate-admin-credentials.js"
   },
   "engines": {
     "node": ">=20.12"
