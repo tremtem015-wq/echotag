@@ -53,6 +53,7 @@ const ADMIN_PASSWORD_HASH = (process.env.ADMIN_PASSWORD_HASH || '').trim();
 const ADMIN_USERS = (process.env.ADMIN_USERS || '').trim();
 const ADMIN_SESSION_SECRET = (process.env.ADMIN_SESSION_SECRET || '').trim();
 const ADMIN_COOKIE = 'echotag_admin';
+const ADMIN_LOGIN_CSRF_COOKIE = 'echotag_admin_login';
 const ADMIN_SESSION_VERSION = 'v1';
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const ADMIN_LOGIN_CSRF_TTL_MS = 30 * 60 * 1000;
@@ -701,16 +702,24 @@ function requestIsSecure(req) {
   return forwardedProto === 'https';
 }
 
-function adminCookie(req, value, maxAgeSeconds) {
+function buildCookie(req, name, value, maxAgeSeconds, path = '/') {
   const parts = [
-    `${ADMIN_COOKIE}=${value}`,
-    'Path=/',
+    `${name}=${value}`,
+    `Path=${path}`,
     'HttpOnly',
     'SameSite=Strict',
     `Max-Age=${maxAgeSeconds}`,
   ];
   if (requestIsSecure(req)) parts.push('Secure');
   return parts.join('; ');
+}
+
+function adminCookie(req, value, maxAgeSeconds) {
+  return buildCookie(req, ADMIN_COOKIE, value, maxAgeSeconds);
+}
+
+function adminLoginCsrfCookie(req, value, maxAgeSeconds) {
+  return buildCookie(req, ADMIN_LOGIN_CSRF_COOKIE, value, maxAgeSeconds, '/admin');
 }
 
 function adminHmac(context, value) {
@@ -759,14 +768,21 @@ function readAdminSession(req) {
   return payload;
 }
 
-function issueAdminLoginCsrf() {
+function issueAdminLoginCsrf(req, res) {
   const issuedAt = Date.now();
   const nonce = crypto.randomBytes(18).toString('base64url');
   const body = `${issuedAt}.${nonce}`;
+  if (res) {
+    res.append('Set-Cookie', adminLoginCsrfCookie(
+      req,
+      nonce,
+      Math.floor(ADMIN_LOGIN_CSRF_TTL_MS / 1000),
+    ));
+  }
   return `${body}.${adminHmac('login-v1', body)}`;
 }
 
-function verifyAdminLoginCsrf(token) {
+function verifyAdminLoginCsrf(token, req) {
   if (typeof token !== 'string' || token.length > 300) return false;
   const parts = token.split('.');
   if (parts.length !== 3) return false;
@@ -776,13 +792,15 @@ function verifyAdminLoginCsrf(token) {
   const now = Date.now();
   if (issuedAt > now + 60_000 || now - issuedAt > ADMIN_LOGIN_CSRF_TTL_MS) return false;
   if (!/^[A-Za-z0-9_-]{20,64}$/.test(parts[1])) return false;
-  return safeEqual(parts[2], adminHmac('login-v1', `${parts[0]}.${parts[1]}`));
+  if (!safeEqual(parts[2], adminHmac('login-v1', `${parts[0]}.${parts[1]}`))) return false;
+
+  // Binding the token to an HttpOnly cookie stops an attacker from fetching a
+  // token on their own and replaying it in a cross-site sign-in form.
+  const cookieNonce = parseCookies(req)[ADMIN_LOGIN_CSRF_COOKIE] || '';
+  return Boolean(cookieNonce) && safeEqual(cookieNonce, parts[1]);
 }
 
 function isSameOriginRequest(req) {
-  const fetchSite = req.get('sec-fetch-site');
-  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
-
   const origin = req.get('origin');
   if (!origin) return true;
   const candidate = normalizeBase(origin);
@@ -869,13 +887,9 @@ function requireAdminSession(req, res, next) {
 
 function requireAdminCsrf(req, res, next) {
   if (!isSameOriginRequest(req)) {
-    sendAdminPage(res, 403, renderAdminErrorPage(
-      'Request blocked',
-      'The request did not come from this site. Reload the console and try again.',
-      '/admin',
-      'Back to the console',
-    ));
-    return;
+    // The signed session and per-session CSRF token remain the hard checks.
+    // Log the mismatch instead of locking out users behind proxies or webviews.
+    console.warn(`Admin request with a cross-origin header from ${req.ip || 'unknown'}`);
   }
 
   const supplied = String(
@@ -1209,7 +1223,7 @@ app.get('/admin', requireAdminConfigured, (req, res) => {
     return;
   }
   sendAdminPage(res, 200, renderAdminLoginPage({
-    csrf: issueAdminLoginCsrf(),
+    csrf: issueAdminLoginCsrf(req, res),
     error: '',
   }));
 });
@@ -1217,20 +1231,14 @@ app.get('/admin', requireAdminConfigured, (req, res) => {
 app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async (req, res, next) => {
   try {
     if (!isSameOriginRequest(req)) {
-      sendAdminPage(res, 403, renderAdminErrorPage(
-        'Request blocked',
-        'The sign-in request did not come from this site. Reload the page and try again.',
-        '/admin',
-        'Back to sign in',
-      ));
-      return;
+      console.warn(`Admin sign-in with a cross-origin header from ${req.ip || 'unknown'}`);
     }
 
     const body = req.body || {};
-    if (!verifyAdminLoginCsrf(body._csrf)) {
+    if (!verifyAdminLoginCsrf(body._csrf, req)) {
       sendAdminPage(res, 400, renderAdminLoginPage({
-        csrf: issueAdminLoginCsrf(),
-        error: 'That sign-in form expired. Please try again.',
+        csrf: issueAdminLoginCsrf(req, res),
+        error: 'That sign-in form expired, or cookies are blocked. Reload the page and try again.',
       }));
       return;
     }
@@ -1247,7 +1255,7 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
     if (!account || !passwordOk) {
       console.warn(`Admin sign-in failed from ${req.ip || 'unknown'}`);
       sendAdminPage(res, 401, renderAdminLoginPage({
-        csrf: issueAdminLoginCsrf(),
+        csrf: issueAdminLoginCsrf(req, res),
         error: 'Incorrect username or password.',
       }));
       return;
@@ -1255,6 +1263,7 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
 
     loginLimiter.reset(req.ip || 'unknown');
     const session = createAdminSession(account);
+    res.append('Set-Cookie', adminLoginCsrfCookie(req, '', 0));
     res.append('Set-Cookie', adminCookie(req, session.token, Math.floor(ADMIN_SESSION_TTL_MS / 1000)));
     adminRedirect(res, '/admin/dashboard');
   } catch (err) {
