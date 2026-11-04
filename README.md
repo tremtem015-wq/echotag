@@ -47,7 +47,7 @@ Security properties:
 
 - Only a signed, `HttpOnly`, `SameSite=Strict` session cookie grants access. Sessions expire after 8 hours.
 - Passwords are verified with scrypt and timing-safe comparisons. No plaintext password fallback exists.
-- Every state-changing admin request requires a signed session plus a CSRF token. Login CSRF tokens are additionally bound to an `HttpOnly`, `SameSite=Strict` cookie so a token fetched elsewhere cannot be replayed.
+- Every state-changing admin request requires a signed session plus a CSRF token. Login CSRF tokens are additionally bound to an `HttpOnly`, `SameSite=Strict` cookie; if a browser drops that cookie, a same-origin request with a valid signed token is still accepted.
 - Cross-origin request headers are logged as a warning and treated as defense-in-depth. The signed session, CSRF token, and `SameSite=Strict` cookies are the enforced checks, so reverse proxies and in-app browsers do not lock admins out.
 - Sign-in is rate-limited to 8 attempts per IP per 15 minutes, and failures return a generic message.
 - Admin pages send `Cache-Control: no-store`, a strict Content Security Policy, `X-Frame-Options: DENY`, `noindex`, and related hardening headers.

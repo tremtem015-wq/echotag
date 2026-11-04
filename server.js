@@ -782,7 +782,7 @@ function issueAdminLoginCsrf(req, res) {
   return `${body}.${adminHmac('login-v1', body)}`;
 }
 
-function verifyAdminLoginCsrf(token, req) {
+function verifyAdminLoginCsrfToken(token) {
   if (typeof token !== 'string' || token.length > 300) return false;
   const parts = token.split('.');
   if (parts.length !== 3) return false;
@@ -792,10 +792,12 @@ function verifyAdminLoginCsrf(token, req) {
   const now = Date.now();
   if (issuedAt > now + 60_000 || now - issuedAt > ADMIN_LOGIN_CSRF_TTL_MS) return false;
   if (!/^[A-Za-z0-9_-]{20,64}$/.test(parts[1])) return false;
-  if (!safeEqual(parts[2], adminHmac('login-v1', `${parts[0]}.${parts[1]}`))) return false;
+  return safeEqual(parts[2], adminHmac('login-v1', `${parts[0]}.${parts[1]}`));
+}
 
-  // Binding the token to an HttpOnly cookie stops an attacker from fetching a
-  // token on their own and replaying it in a cross-site sign-in form.
+function loginCsrfCookieMatches(req, token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) return false;
   const cookieNonce = parseCookies(req)[ADMIN_LOGIN_CSRF_COOKIE] || '';
   return Boolean(cookieNonce) && safeEqual(cookieNonce, parts[1]);
 }
@@ -1235,11 +1237,23 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
     }
 
     const body = req.body || {};
-    if (!verifyAdminLoginCsrf(body._csrf, req)) {
+    const tokenOk = verifyAdminLoginCsrfToken(body._csrf);
+    const cookieOk = tokenOk && loginCsrfCookieMatches(req, body._csrf);
+    if (!tokenOk) {
       sendAdminPage(res, 400, renderAdminLoginPage({
         csrf: issueAdminLoginCsrf(req, res),
-        error: 'That sign-in form expired, or cookies are blocked. Reload the page and try again.',
+        error: 'That sign-in form expired. Reload the page and try again.',
       }));
+      return;
+    }
+    if (!cookieOk && !isSameOriginRequest(req)) {
+      console.warn(`Admin sign-in was missing its CSRF cookie from ${req.ip || 'unknown'}`);
+      sendAdminPage(res, 403, renderAdminErrorPage(
+        'Request blocked',
+        'The sign-in request did not come from this site. Reload the page and try again.',
+        '/admin',
+        'Back to sign in',
+      ));
       return;
     }
 
