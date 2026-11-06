@@ -530,7 +530,7 @@ async function readStateDocument(name, fallback, { force = false } = {}) {
   if (STORAGE_MODE === 'blob') {
     try {
       const info = await head(`${BLOB_STATE_PREFIX}${name}.json`, { token: BLOB_TOKEN });
-      const response = await fetch(info.url, { cache: 'no-store' });
+      const response = await fetch(blobReadUrl(info.url, info.uploadedAt), { cache: 'no-store' });
       if (response.ok) raw = await response.text();
     } catch (err) {
       if (!isBlobMissing(err)) console.warn(`State read warning (${name}):`, err.message);
@@ -558,7 +558,7 @@ async function writeStateDocument(name, value) {
       contentType: 'application/json',
       addRandomSuffix: false,
       allowOverwrite: true,
-      cacheControlMaxAge: 60,
+      cacheControlMaxAge: 0,
       token: BLOB_TOKEN,
     });
   } else {
@@ -886,6 +886,21 @@ function isBlobMissing(err) {
   return err instanceof BlobNotFoundError || (err && (err.name === 'BlobNotFoundError' || err.statusCode === 404));
 }
 
+// Vercel Blob overwrites can serve the previous version from the CDN for up
+// to a minute. Mutable metadata and state must be read with cache=0 so that
+// moderation, blocks, and administrator changes take effect immediately.
+function blobReadUrl(url, version) {
+  try {
+    const parsed = new URL(String(url));
+    const stamp = version instanceof Date ? version.getTime() : (version || Date.now());
+    parsed.searchParams.set('cache', '0');
+    parsed.searchParams.set('v', String(stamp));
+    return parsed.toString();
+  } catch {
+    return String(url);
+  }
+}
+
 function parseMeta(value, code) {
   if (!value || value.code !== code || !value.mime) return null;
   return value;
@@ -901,7 +916,7 @@ async function readMetaFromBlob(code) {
   }
 
   try {
-    const response = await fetch(info.url, { cache: 'no-store' });
+    const response = await fetch(blobReadUrl(info.url, info.uploadedAt), { cache: 'no-store' });
     if (!response.ok) return null;
     return parseMeta(await response.json(), code);
   } catch {
@@ -947,7 +962,7 @@ async function listRecordingsFromBlob() {
       const results = await Promise.allSettled(batch.map(async (blob) => {
         const code = blob.pathname.slice(BLOB_META_PREFIX.length, -'.json'.length);
         if (!CODE_PATTERN.test(code)) return null;
-        const response = await fetch(blob.url, { cache: 'no-store' });
+        const response = await fetch(blobReadUrl(blob.url, blob.uploadedAt), { cache: 'no-store' });
         if (!response.ok) return null;
         return parseMeta(await response.json(), code);
       }));
@@ -1028,7 +1043,7 @@ async function writeMeta(meta) {
       contentType: 'application/json',
       addRandomSuffix: false,
       allowOverwrite: true,
-      cacheControlMaxAge: 60,
+      cacheControlMaxAge: 0,
       token: BLOB_TOKEN,
     });
     return;
