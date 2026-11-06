@@ -794,3 +794,78 @@ body.is-playing .play-button .icon-pause {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ---------- Blocked notice ---------- */
+
+.player-blocked {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 4, 9, 0.9);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.player-blocked[hidden] {
+  display: none;
+}
+
+body.is-blocked {
+  overflow: hidden;
+}
+
+.player-blocked-card {
+  width: min(430px, 100%);
+  padding: 30px;
+  border: 1px solid rgba(251, 113, 133, 0.32);
+  border-radius: 26px;
+  background: linear-gradient(180deg, rgba(35, 18, 28, 0.96), rgba(15, 11, 18, 0.98));
+  box-shadow: 0 40px 100px -40px rgba(0, 0, 0, 0.95);
+  text-align: center;
+}
+
+.player-blocked-icon {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 16px;
+  border: 1px solid rgba(251, 113, 133, 0.32);
+  border-radius: 18px;
+  background: rgba(251, 113, 133, 0.1);
+  color: #fecdd3;
+}
+
+.player-blocked-icon svg {
+  width: 26px;
+  height: 26px;
+}
+
+.player-blocked-card h2 {
+  margin: 10px 0 12px;
+  font-size: 25px;
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+}
+
+.player-blocked-card #playerBlockedReason {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(251, 113, 133, 0.2);
+  border-radius: 12px;
+  background: rgba(251, 113, 133, 0.07);
+  color: #fecdd3;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.player-blocked-help {
+  margin: 14px 0 0;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.6;
+}

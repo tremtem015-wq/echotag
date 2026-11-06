@@ -10,16 +10,23 @@
   const totalEl = document.getElementById('totalTime');
   const statusLine = document.getElementById('statusLine');
   const hint = document.getElementById('hint');
+  const blockedPanel = document.getElementById('playerBlocked');
+  const blockedReason = document.getElementById('playerBlockedReason');
 
   if (!audio || !noteCard || !playBtn) return;
 
   const bars = wave ? Array.from(wave.querySelectorAll('span')) : [];
   const autoplayWanted = document.body.dataset.autoplay === '1';
   const metaDuration = Number(document.body.dataset.duration) || 0;
+  const shareCode = document.body.dataset.code || '';
+  const PRESENCE_INTERVAL_MS = 45000;
 
   let duration = metaDuration;
   let autoplayTried = false;
   let hasPlayed = false;
+  let presenceTimer = 0;
+  let presenceBusy = false;
+  let blockedState = false;
 
   totalEl.textContent = formatDuration(duration);
 
@@ -231,6 +238,54 @@
       // Media Session is a progressive enhancement.
     }
   }
+
+  function sendPresence() {
+    if (blockedState || presenceBusy) return;
+    presenceBusy = true;
+    fetch('/api/presence', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ page: 'player', code: shareCode }),
+    })
+      .then(async (response) => {
+        if (response.status !== 403) return;
+        const data = await response.json().catch(() => null);
+        if (data && data.blocked) showBlocked(data);
+      })
+      .catch(() => {
+        // Presence is best-effort; playback continues when the heartbeat fails.
+      })
+      .finally(() => {
+        presenceBusy = false;
+      });
+  }
+
+  function showBlocked(data) {
+    if (blockedState) return;
+    blockedState = true;
+    window.clearInterval(presenceTimer);
+    presenceTimer = 0;
+    audio.pause();
+    playBtn.disabled = true;
+    if (seek) seek.disabled = true;
+    if (blockedPanel) {
+      if (data && data.reason && blockedReason) {
+        blockedReason.textContent = `An administrator blocked this IP address. Reason: ${data.reason}`;
+      }
+      blockedPanel.hidden = false;
+    }
+    document.body.classList.add('is-blocked');
+    setStatus('Access blocked');
+    setHint('An administrator has blocked this IP address.', true);
+  }
+
+  sendPresence();
+  presenceTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') sendPresence();
+  }, PRESENCE_INTERVAL_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') sendPresence();
+  });
 
   updateProgress();
   setPlaying(false);

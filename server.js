@@ -10,6 +10,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -66,12 +67,28 @@ const SCRYPT_KEYLEN = 64;
 const SCRYPT_MAXMEM = 64 * 1024 * 1024;
 
 const DATA_DIR = path.join(__dirname, 'data', 'recordings');
+const STATE_DIR = path.join(__dirname, 'data', 'state');
+const ACTIVITY_DIR = path.join(__dirname, 'data', 'activity');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const APP_URL_PATH = __dirname;
 const BLOB_META_PREFIX = 'echotag/meta/';
 const BLOB_AUDIO_PREFIX = 'echotag/audio/';
+const BLOB_STATE_PREFIX = 'echotag/state/';
+const BLOB_ACTIVITY_PREFIX = 'echotag/activity/';
+const STATE_CACHE_TTL_MS = 5_000;
+const PRESENCE_TTL_MS = 2 * 60 * 1000;
+const PRESENCE_LOG_INTERVAL_MS = 30 * 60 * 1000;
+const ACTIVITY_LIMIT = 400;
+const GRADE_LEVELS = Object.freeze([
+  'M.1', 'M.2', 'M.3', 'M.4', 'M.5', 'M.6',
+  'G.7', 'G.8', 'G.9', 'G.10', 'G.11', 'G.12',
+]);
 
-if (STORAGE_MODE === 'file') fs.mkdirSync(DATA_DIR, { recursive: true });
+if (STORAGE_MODE === 'file') {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(ACTIVITY_DIR, { recursive: true });
+}
 
 let activePort = PORT;
 
@@ -236,6 +253,594 @@ function sniffAudioMime(buffer) {
 function formatDuration(seconds) {
   const total = Math.max(0, Math.round(Number(seconds) || 0));
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Identity, quality, and moderation helpers                           */
+/* ------------------------------------------------------------------ */
+
+function cleanStudentName(raw) {
+  const value = String(raw || '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/[<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+
+  if (value.length < 2) return { error: 'Enter the student’s full name.' };
+  if (!/\p{L}/u.test(value)) return { error: 'Enter a name that contains letters.' };
+  if (!/^[\p{L}\p{M} .'’\-]+$/u.test(value)) {
+    return { error: 'Use letters, spaces, hyphens, apostrophes, or periods only.' };
+  }
+  return { value };
+}
+
+function cleanStudentId(raw) {
+  const value = String(raw || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .slice(0, 30);
+
+  if (!/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(value)) {
+    return { error: 'Enter a student ID with 3–30 letters, numbers, dots, dashes, or slashes.' };
+  }
+  return { value };
+}
+
+function readStudentInput(body) {
+  const name = cleanStudentName(body && body.studentName);
+  const id = cleanStudentId(body && body.studentId);
+  const grade = String((body && body.grade) || '').trim().toUpperCase();
+  const errors = [];
+  if (name.error) errors.push(name.error);
+  if (id.error) errors.push(id.error);
+  if (!GRADE_LEVELS.includes(grade)) errors.push('Select a valid grade level.');
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    student: errors.length === 0
+      ? { name: name.value, id: id.value, grade }
+      : null,
+  };
+}
+
+function roundMetric(value, places = 3) {
+  const factor = 10 ** places;
+  return Math.round((Number(value) || 0) * factor) / factor;
+}
+
+function parseQualityStats(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      averageLevel: clampNumber(Number(parsed.averageLevel), 0, 1, 0),
+      peakLevel: clampNumber(Number(parsed.peakLevel), 0, 1, 0),
+      silenceRatio: clampNumber(Number(parsed.silenceRatio), 0, 1, 0),
+      clippingRatio: clampNumber(Number(parsed.clippingRatio), 0, 1, 0),
+      samples: Math.round(clampNumber(Number(parsed.samples), 0, 100000, 0)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function analyzeAudioQuality({ duration, peaks, stats }) {
+  const values = Array.isArray(peaks) ? peaks : [];
+  const averagePeak = values.length
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : 0;
+  const quietRatio = values.length
+    ? values.filter((value) => value < 0.12).length / values.length
+    : 1;
+  const hasStats = Boolean(stats && stats.samples >= 5);
+  const silenceRatio = hasStats ? stats.silenceRatio : quietRatio;
+  const averageLevel = hasStats ? stats.averageLevel : 0;
+  const clippingRatio = hasStats ? stats.clippingRatio : 0;
+
+  let penalty = 0;
+  const reasons = [];
+
+  if (!duration || duration < 1.2) {
+    penalty += 40;
+    reasons.push('Very short clip');
+  } else if (duration < 2) {
+    penalty += 22;
+    reasons.push('Short clip');
+  } else if (duration < 3) {
+    penalty += 8;
+    reasons.push('Quite short');
+  }
+
+  if (silenceRatio > 0.72) {
+    penalty += 32;
+    reasons.push('Mostly silence');
+  } else if (silenceRatio > 0.55) {
+    penalty += 16;
+    reasons.push('Long silent gaps');
+  }
+
+  if (averagePeak < 0.16) {
+    penalty += 22;
+    reasons.push('Very low signal');
+  } else if (averagePeak < 0.28) {
+    penalty += 10;
+    reasons.push('Low signal');
+  }
+
+  if (hasStats && averageLevel > 0 && averageLevel < 0.0025) {
+    penalty += 12;
+    reasons.push('Very quiet microphone');
+  }
+
+  if (clippingRatio > 0.06) {
+    penalty += 18;
+    reasons.push('Heavy clipping');
+  } else if (clippingRatio > 0.015) {
+    penalty += 7;
+    reasons.push('Possible clipping');
+  }
+
+  const score = Math.max(0, Math.min(100, Math.round(100 - penalty)));
+  const label = score >= 75 ? 'good' : score >= 50 ? 'fair' : 'poor';
+
+  return {
+    score,
+    label,
+    reasons: [...new Set(reasons)],
+    reviewRequired: score < 60,
+    metrics: {
+      averagePeak: roundMetric(averagePeak),
+      quietRatio: roundMetric(quietRatio),
+      silenceRatio: roundMetric(silenceRatio),
+      averageLevel: roundMetric(averageLevel, 4),
+      clippingRatio: roundMetric(clippingRatio, 4),
+      samples: hasStats ? stats.samples : 0,
+    },
+    analyzedAt: new Date().toISOString(),
+  };
+}
+
+function moderationFor(meta) {
+  const source = meta && meta.moderation && typeof meta.moderation === 'object'
+    ? meta.moderation
+    : {};
+  const status = ['pending', 'approved', 'hidden', 'flagged'].includes(source.status)
+    ? source.status
+    : 'pending';
+  return {
+    status,
+    quality: source.quality && typeof source.quality === 'object' ? source.quality : null,
+    note: typeof source.note === 'string' ? source.note : '',
+    reviewedAt: typeof source.reviewedAt === 'string' ? source.reviewedAt : '',
+    reviewedBy: typeof source.reviewedBy === 'string' ? source.reviewedBy : '',
+  };
+}
+
+function isPubliclyVisible(meta) {
+  const status = moderationFor(meta).status;
+  return status !== 'hidden' && status !== 'flagged';
+}
+
+function recordingStudent(meta) {
+  if (!meta || !meta.student) return null;
+  const decoded = decryptJsonValue(meta.student);
+  if (!decoded || typeof decoded !== 'object') return null;
+  const name = typeof decoded.name === 'string' ? decoded.name : '';
+  const id = typeof decoded.id === 'string' ? decoded.id : '';
+  const grade = typeof decoded.grade === 'string' ? decoded.grade : '';
+  if (!name && !id && !grade) return null;
+  return { name, id, grade };
+}
+
+const MODERATION_LABELS = Object.freeze({
+  pending: 'Pending review',
+  approved: 'Approved',
+  hidden: 'Hidden',
+  flagged: 'Flagged',
+});
+
+/* ------------------------------------------------------------------ */
+/* Encrypted state + activity storage                                  */
+/* ------------------------------------------------------------------ */
+
+const STATE_ENCRYPTION_KEY = (() => {
+  if (!ADMIN_SESSION_SECRET) return null;
+  try {
+    return Buffer.from(crypto.hkdfSync(
+      'sha256',
+      Buffer.from(ADMIN_SESSION_SECRET, 'utf8'),
+      Buffer.from('echotag', 'utf8'),
+      Buffer.from('state-v1', 'utf8'),
+      32,
+    ));
+  } catch {
+    return crypto.createHash('sha256').update(`echotag-state:${ADMIN_SESSION_SECRET}`).digest();
+  }
+})();
+
+function encryptJsonValue(value) {
+  if (!STATE_ENCRYPTION_KEY) return value;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', STATE_ENCRYPTION_KEY, iv);
+  const plaintext = Buffer.from(JSON.stringify(value), 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return {
+    v: 1,
+    iv: iv.toString('base64url'),
+    tag: cipher.getAuthTag().toString('base64url'),
+    data: ciphertext.toString('base64url'),
+  };
+}
+
+function decryptJsonValue(value) {
+  if (!value || typeof value !== 'object' || value.v !== 1
+    || typeof value.iv !== 'string' || typeof value.tag !== 'string' || typeof value.data !== 'string') {
+    return value;
+  }
+  if (!STATE_ENCRYPTION_KEY) return null;
+  try {
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      STATE_ENCRYPTION_KEY,
+      Buffer.from(value.iv, 'base64url'),
+    );
+    decipher.setAuthTag(Buffer.from(value.tag, 'base64url'));
+    const plaintext = Buffer.concat([
+      decipher.update(Buffer.from(value.data, 'base64url')),
+      decipher.final(),
+    ]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function encodeStoredDocument(value) {
+  const encrypted = encryptJsonValue(value);
+  return JSON.stringify(STATE_ENCRYPTION_KEY
+    ? { enc: 'echotag-state-v1', payload: encrypted }
+    : value);
+}
+
+function decodeStoredDocument(raw, fallback) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.enc === 'echotag-state-v1') {
+      return decryptJsonValue(parsed.payload) ?? fallback;
+    }
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const stateCache = new Map();
+
+async function readStateDocument(name, fallback, { force = false } = {}) {
+  const cached = stateCache.get(name);
+  if (!force && cached && Date.now() - cached.at < STATE_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  let raw = null;
+  if (STORAGE_MODE === 'blob') {
+    try {
+      const info = await head(`${BLOB_STATE_PREFIX}${name}.json`, { token: BLOB_TOKEN });
+      const response = await fetch(info.url, { cache: 'no-store' });
+      if (response.ok) raw = await response.text();
+    } catch (err) {
+      if (!isBlobMissing(err)) console.warn(`State read warning (${name}):`, err.message);
+    }
+  } else if (STORAGE_MODE === 'file') {
+    try {
+      raw = await fsp.readFile(path.join(STATE_DIR, `${name}.json`), 'utf8');
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`State read warning (${name}):`, err.message);
+    }
+  }
+
+  const value = raw ? decodeStoredDocument(raw, fallback) : fallback;
+  stateCache.set(name, { at: Date.now(), value });
+  return value;
+}
+
+async function writeStateDocument(name, value) {
+  if (STORAGE_MODE === 'unavailable') throw httpError(503, 'Storage is not connected.');
+
+  const raw = encodeStoredDocument(value);
+  if (STORAGE_MODE === 'blob') {
+    await put(`${BLOB_STATE_PREFIX}${name}.json`, raw, {
+      access: 'public',
+      contentType: 'application/json',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 60,
+      token: BLOB_TOKEN,
+    });
+  } else {
+    const target = path.join(STATE_DIR, `${name}.json`);
+    const temp = `${target}.${process.pid}.tmp`;
+    await fsp.writeFile(temp, raw);
+    await fsp.rename(temp, target);
+  }
+  stateCache.set(name, { at: Date.now(), value });
+}
+
+function invalidateState(name) {
+  stateCache.delete(name);
+}
+
+function activityFileStem() {
+  return `${String(9_999_999_999_999 - Date.now()).padStart(13, '0')}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+async function logActivity(event) {
+  if (STORAGE_MODE === 'unavailable') return;
+  const entry = {
+    id: crypto.randomBytes(9).toString('base64url'),
+    at: new Date().toISOString(),
+    ...event,
+  };
+  const raw = encodeStoredDocument(entry);
+  const stem = activityFileStem();
+
+  if (STORAGE_MODE === 'blob') {
+    await put(`${BLOB_ACTIVITY_PREFIX}${stem}.json`, raw, {
+      access: 'public',
+      contentType: 'application/json',
+      addRandomSuffix: false,
+      cacheControlMaxAge: 60,
+      token: BLOB_TOKEN,
+    });
+    return;
+  }
+
+  await fsp.writeFile(path.join(ACTIVITY_DIR, `${stem}.json`), raw);
+}
+
+async function listActivityEntries(limit = ACTIVITY_LIMIT) {
+  const names = [];
+  if (STORAGE_MODE === 'blob') {
+    try {
+      const page = await list({
+        prefix: BLOB_ACTIVITY_PREFIX,
+        limit,
+        token: BLOB_TOKEN,
+      });
+      for (const blob of page.blobs) {
+        if (blob.pathname.endsWith('.json')) names.push(blob);
+      }
+    } catch (err) {
+      console.warn('Activity list warning:', err.message);
+      return [];
+    }
+  } else if (STORAGE_MODE === 'file') {
+    try {
+      const files = (await fsp.readdir(ACTIVITY_DIR))
+        .filter((name) => name.endsWith('.json'))
+        .sort()
+        .slice(0, limit);
+      for (const name of files) names.push({ pathname: name });
+    } catch {
+      return [];
+    }
+  } else {
+    return [];
+  }
+
+  const entries = [];
+  for (let index = 0; index < names.length; index += 10) {
+    const batch = names.slice(index, index + 10);
+    const results = await Promise.allSettled(batch.map(async (blob) => {
+      let raw;
+      if (STORAGE_MODE === 'blob') {
+        const response = await fetch(blob.url, { cache: 'no-store' });
+        if (!response.ok) return null;
+        raw = await response.text();
+      } else {
+        raw = await fsp.readFile(path.join(ACTIVITY_DIR, blob.pathname), 'utf8');
+      }
+      const entry = decodeStoredDocument(raw, null);
+      return entry && typeof entry.at === 'string' ? entry : null;
+    }));
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) entries.push(result.value);
+    }
+  }
+
+  return entries
+    .sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0))
+    .slice(0, limit);
+}
+
+/* ------------------------------------------------------------------ */
+/* IP blocks + presence                                                */
+/* ------------------------------------------------------------------ */
+
+function normalizeIp(raw) {
+  let value = String(raw || '').trim();
+  if (value.startsWith('::ffff:')) value = value.slice(7);
+  if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+  if (!net.isIP(value)) return '';
+  return value.toLowerCase();
+}
+
+function clientIp(req) {
+  return normalizeIp(req.ip) || 'unknown';
+}
+
+function cleanBlockReason(raw) {
+  const value = String(raw || '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  if (value.length < 3) return { error: 'Enter a reason with at least 3 characters.' };
+  return { value };
+}
+
+async function readBlocks({ force = false } = {}) {
+  const doc = await readStateDocument('ip-blocks', { blocks: [] }, { force });
+  return Array.isArray(doc.blocks)
+    ? doc.blocks.filter((block) => block && normalizeIp(block.ip))
+    : [];
+}
+
+async function findBlockForIp(ip) {
+  const normalized = normalizeIp(ip);
+  if (!normalized) return null;
+  const blocks = await readBlocks();
+  return blocks.find((block) => normalizeIp(block.ip) === normalized) || null;
+}
+
+async function addIpBlock({ ip, reason, blockedBy }) {
+  const normalized = normalizeIp(ip);
+  if (!normalized) throw httpError(400, 'Enter a valid IPv4 or IPv6 address.');
+  const cleanReason = cleanBlockReason(reason);
+  if (cleanReason.error) throw httpError(400, cleanReason.error);
+
+  const doc = await readStateDocument('ip-blocks', { blocks: [] }, { force: true });
+  const blocks = Array.isArray(doc.blocks) ? doc.blocks : [];
+  if (blocks.some((block) => normalizeIp(block.ip) === normalized)) {
+    throw httpError(409, 'That IP address is already blocked.');
+  }
+
+  const record = {
+    ip: normalized,
+    reason: cleanReason.value,
+    blockedBy: String(blockedBy || 'administrator').slice(0, 80),
+    blockedAt: new Date().toISOString(),
+  };
+  await writeStateDocument('ip-blocks', { blocks: [...blocks, record] });
+  return record;
+}
+
+async function removeIpBlock(ip) {
+  const normalized = normalizeIp(ip);
+  if (!normalized) throw httpError(400, 'Enter a valid IPv4 or IPv6 address.');
+  const doc = await readStateDocument('ip-blocks', { blocks: [] }, { force: true });
+  const blocks = Array.isArray(doc.blocks) ? doc.blocks : [];
+  const record = blocks.find((block) => normalizeIp(block.ip) === normalized);
+  if (!record) return null;
+  await writeStateDocument('ip-blocks', {
+    blocks: blocks.filter((block) => normalizeIp(block.ip) !== normalized),
+  });
+  return record;
+}
+
+function blockedApiResponse(res, block) {
+  res.set('Cache-Control', 'no-store');
+  res.status(403).json({
+    error: `An administrator has blocked this IP address. Reason: ${block.reason}`,
+    blocked: true,
+    reason: block.reason,
+    blockedAt: block.blockedAt,
+  });
+}
+
+async function publicApiBlockGate(req, res, next) {
+  try {
+    const block = await findBlockForIp(clientIp(req));
+    if (block) {
+      blockedApiResponse(res, block);
+      return;
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function publicPageBlockGate(req, res, next) {
+  try {
+    const block = await findBlockForIp(clientIp(req));
+    if (block) {
+      res.set({
+        'Cache-Control': 'no-store',
+        'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      });
+      res.status(403).type('html').send(renderBlockedPage(block));
+      return;
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function publicMediaBlockGate(req, res, next) {
+  try {
+    const block = await findBlockForIp(clientIp(req));
+    if (block) {
+      res.set('Cache-Control', 'no-store');
+      res.status(403).type('text/plain').send('An administrator has blocked this IP address.');
+      return;
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+const presenceRecords = new Map();
+
+function prunePresence(now = Date.now()) {
+  for (const [ip, record] of presenceRecords) {
+    if (now - record.lastSeen > PRESENCE_TTL_MS) presenceRecords.delete(ip);
+  }
+}
+
+function touchPresence(req, { page, code, student } = {}) {
+  const ip = clientIp(req);
+  if (ip === 'unknown') return null;
+
+  const now = Date.now();
+  prunePresence(now);
+  let record = presenceRecords.get(ip);
+  if (!record) {
+    record = {
+      ip,
+      firstSeen: now,
+      lastSeen: now,
+      hits: 0,
+      page: 'recorder',
+      code: '',
+      userAgent: '',
+      visitLoggedAt: 0,
+      student: null,
+    };
+    presenceRecords.set(ip, record);
+  }
+
+  record.lastSeen = now;
+  record.hits += 1;
+  if (page) record.page = page;
+  if (code) record.code = code;
+  record.userAgent = String(req.get('user-agent') || '').slice(0, 180);
+  if (student) {
+    record.student = student;
+    record.studentAt = now;
+  }
+  return record;
+}
+
+function listPresence() {
+  const now = Date.now();
+  prunePresence(now);
+  return [...presenceRecords.values()]
+    .map((record) => ({
+      ...record,
+      active: now - record.lastSeen <= PRESENCE_TTL_MS,
+    }))
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+function presenceForIp(ip) {
+  return presenceRecords.get(normalizeIp(ip) || ip) || null;
 }
 
 function formatDate(isoDate) {
@@ -417,6 +1022,18 @@ async function getPlayableRecording(code) {
 }
 
 async function writeMeta(meta) {
+  if (STORAGE_MODE === 'blob') {
+    await put(blobMetaPathname(meta.code), JSON.stringify(meta, null, 2), {
+      access: 'public',
+      contentType: 'application/json',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 60,
+      token: BLOB_TOKEN,
+    });
+    return;
+  }
+
   const target = path.join(DATA_DIR, `${meta.code}.json`);
   const temp = `${target}.${process.pid}.tmp`;
   await fsp.writeFile(temp, JSON.stringify(meta, null, 2));
@@ -436,13 +1053,7 @@ async function saveRecording(meta, buffer) {
     meta.audioUrl = audio.url;
 
     try {
-      await put(blobMetaPathname(meta.code), JSON.stringify(meta, null, 2), {
-        access: 'public',
-        contentType: 'application/json',
-        addRandomSuffix: false,
-        cacheControlMaxAge: 60 * 60,
-        token: BLOB_TOKEN,
-      });
+      await writeMeta(meta);
     } catch (err) {
       await del(audio.url, { token: BLOB_TOKEN }).catch(() => {});
       throw err;
@@ -636,19 +1247,25 @@ function isUsableAdminUsername(username) {
     && !/[\u0000-\u001f\u007f:]/.test(username);
 }
 
-const ADMIN_ACCOUNTS = (() => {
+function buildAdminAccount(username, hash, source, extra = {}) {
+  const name = String(username || '').trim();
+  const value = String(hash || '').trim();
+  if (!isUsableAdminUsername(name) || !parsePasswordHash(value)) return null;
+  return {
+    username: name,
+    hash: value,
+    fingerprint: sha256(value).slice(0, 32),
+    source,
+    ...extra,
+  };
+}
+
+const ENV_ADMIN_ACCOUNTS = (() => {
   const accounts = new Map();
   const add = (username, hash) => {
-    const name = String(username || '').trim();
-    const value = String(hash || '').trim();
-    if (!isUsableAdminUsername(name) || !parsePasswordHash(value)) return false;
-    if (!accounts.has(name)) {
-      accounts.set(name, {
-        username: name,
-        hash: value,
-        fingerprint: sha256(value).slice(0, 32),
-      });
-    }
+    const account = buildAdminAccount(username, hash, 'built-in');
+    if (!account || accounts.has(account.username)) return false;
+    accounts.set(account.username, account);
     return true;
   };
 
@@ -668,14 +1285,130 @@ const ADMIN_CONFIG_ISSUE = (() => {
   if (ADMIN_SESSION_SECRET.length < 32) {
     return 'ADMIN_SESSION_SECRET must be at least 32 characters.';
   }
-  if (ADMIN_ACCOUNTS.size === 0) {
+  if (ENV_ADMIN_ACCOUNTS.size === 0) {
     return 'No valid admin accounts are configured. Check ADMIN_USERNAME/ADMIN_PASSWORD_HASH and ADMIN_USERS.';
   }
   return null;
 })();
 const ADMIN_CONFIGURED = ADMIN_CONFIG_ISSUE === null;
 // Used to spend the same scrypt time when a username does not exist.
-const ADMIN_TIMING_HASH = ADMIN_ACCOUNTS.values().next().value?.hash || '';
+const ADMIN_TIMING_HASH = ENV_ADMIN_ACCOUNTS.values().next().value?.hash || '';
+
+let adminAccountCache = { at: 0, accounts: null };
+
+async function loadAdminAccounts({ force = false } = {}) {
+  if (!force && adminAccountCache.accounts && Date.now() - adminAccountCache.at < STATE_CACHE_TTL_MS) {
+    return adminAccountCache.accounts;
+  }
+
+  const accounts = new Map(ENV_ADMIN_ACCOUNTS);
+  try {
+    const doc = await readStateDocument('admins', { admins: [] });
+    const records = Array.isArray(doc.admins) ? doc.admins : [];
+    for (const record of records) {
+      const account = buildAdminAccount(
+        record && record.username,
+        record && record.passwordHash,
+        'added',
+        {
+          createdAt: typeof record?.createdAt === 'string' ? record.createdAt : '',
+          createdBy: typeof record?.createdBy === 'string' ? record.createdBy : '',
+        },
+      );
+      if (account && !accounts.has(account.username)) accounts.set(account.username, account);
+    }
+  } catch (err) {
+    console.warn('Dynamic admin load warning:', err.message);
+  }
+
+  adminAccountCache = { at: Date.now(), accounts };
+  return accounts;
+}
+
+async function getAdminAccount(username, options) {
+  const accounts = await loadAdminAccounts(options);
+  return accounts.get(username);
+}
+
+function invalidateAdminAccounts() {
+  adminAccountCache = { at: 0, accounts: null };
+}
+
+async function listAdminAccounts() {
+  const accounts = await loadAdminAccounts({ force: true });
+  return [...accounts.values()].sort((a, b) => {
+    if (a.source !== b.source) return a.source === 'built-in' ? -1 : 1;
+    return a.username.localeCompare(b.username);
+  });
+}
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const key = await new Promise((resolve, reject) => {
+    crypto.scrypt(
+      Buffer.from(String(password), 'utf8'),
+      salt,
+      SCRYPT_KEYLEN,
+      { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: SCRYPT_MAXMEM },
+      (err, derived) => (err ? reject(err) : resolve(derived)),
+    );
+  });
+  return `scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${salt.toString('base64url')}$${key.toString('base64url')}`;
+}
+
+function validateNewAdmin({ username, password, confirmPassword }) {
+  const name = String(username || '').trim();
+  const pass = String(password || '');
+  const confirm = String(confirmPassword || '');
+  const errors = [];
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,39}$/.test(name)) {
+    errors.push('Use 3–40 letters, numbers, dots, dashes, or underscores for the username.');
+  }
+  if (pass.length < 10) errors.push('The password must be at least 10 characters.');
+  if (pass.length > 200) errors.push('The password is too long.');
+  if (pass !== confirm) errors.push('The two passwords do not match.');
+
+  return { ok: errors.length === 0, errors, username: name, password: pass };
+}
+
+async function addDynamicAdmin({ username, password, createdBy }) {
+  const accounts = await loadAdminAccounts({ force: true });
+  const lower = String(username).toLowerCase();
+  if ([...accounts.keys()].some((name) => name.toLowerCase() === lower)) {
+    throw httpError(409, 'An administrator with that username already exists.');
+  }
+
+  const doc = await readStateDocument('admins', { admins: [] }, { force: true });
+  const records = Array.isArray(doc.admins) ? doc.admins : [];
+  const passwordHash = await hashPassword(password);
+  const record = {
+    username,
+    passwordHash,
+    createdAt: new Date().toISOString(),
+    createdBy: String(createdBy || 'administrator').slice(0, 80),
+  };
+  await writeStateDocument('admins', { admins: [...records, record] });
+  invalidateAdminAccounts();
+  return record;
+}
+
+async function removeDynamicAdmin(username) {
+  const account = await getAdminAccount(username, { force: true });
+  if (!account) throw httpError(404, 'That administrator does not exist.');
+  if (account.source !== 'added') {
+    throw httpError(403, 'Built-in administrators cannot be removed here.');
+  }
+
+  const doc = await readStateDocument('admins', { admins: [] }, { force: true });
+  const records = Array.isArray(doc.admins) ? doc.admins : [];
+  const next = records.filter((record) => record && record.username !== username);
+  if (next.length === records.length) throw httpError(404, 'That administrator does not exist.');
+
+  await writeStateDocument('admins', { admins: next });
+  invalidateAdminAccounts();
+  return account;
+}
 
 function parseCookies(req) {
   const header = req.get('cookie') || '';
@@ -741,7 +1474,7 @@ function createAdminSession(account) {
   return { token: `${ADMIN_SESSION_VERSION}.${body}.${signature}`, payload };
 }
 
-function readAdminSession(req) {
+async function readAdminSession(req) {
   if (!ADMIN_CONFIGURED) return null;
   const token = parseCookies(req)[ADMIN_COOKIE];
   if (!token) return null;
@@ -758,7 +1491,13 @@ function readAdminSession(req) {
   }
 
   if (!payload || payload.v !== 1) return null;
-  const account = ADMIN_ACCOUNTS.get(payload.u);
+  let account;
+  try {
+    account = await getAdminAccount(payload.u);
+  } catch (err) {
+    console.warn('Admin session account lookup failed:', err.message);
+    return null;
+  }
   if (!account || payload.f !== account.fingerprint) return null;
   if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) return null;
   const now = Date.now();
@@ -877,14 +1616,18 @@ function requireAdminConfigured(req, res, next) {
   next();
 }
 
-function requireAdminSession(req, res, next) {
-  const session = readAdminSession(req);
-  if (!session) {
-    res.redirect(303, '/admin');
-    return;
+async function requireAdminSession(req, res, next) {
+  try {
+    const session = await readAdminSession(req);
+    if (!session) {
+      res.redirect(303, '/admin');
+      return;
+    }
+    req.adminSession = session;
+    next();
+  } catch (err) {
+    next(err);
   }
-  req.adminSession = session;
-  next();
 }
 
 function requireAdminCsrf(req, res, next) {
@@ -1019,7 +1762,7 @@ async function streamLocalAudio(req, res, next, meta, cacheControl) {
 /* Routes                                                              */
 /* ------------------------------------------------------------------ */
 
-app.get('/api/config', (req, res) => {
+app.get('/api/config', publicApiBlockGate, (req, res) => {
   const lanIp = pickLanIp();
   res.json({
     defaultBaseUrl: defaultBaseFor(req),
@@ -1029,6 +1772,7 @@ app.get('/api/config', (req, res) => {
     maxBytes: MAX_BYTES,
     storage: STORAGE_MODE,
     uploadEnabled: STORAGE_MODE !== 'unavailable',
+    grades: GRADE_LEVELS,
   });
 });
 
@@ -1042,11 +1786,18 @@ function requireStorage(req, res, next) {
   next();
 }
 
-app.post('/api/recordings', uploadLimiter, requireStorage, upload.single('audio'), async (req, res, next) => {
+app.post('/api/recordings', publicApiBlockGate, uploadLimiter, requireStorage, upload.single('audio'), async (req, res, next) => {
   try {
     if (!req.file || !req.file.size) throw httpError(400, 'No audio was uploaded.');
     if (req.file.size < 100) throw httpError(400, 'That audio file looks empty.');
     if (req.file.size > MAX_BYTES) throw httpError(413, 'That recording is too large.');
+
+    const identity = readStudentInput(req.body);
+    if (!identity.ok) {
+      const err = httpError(400, identity.errors.join(' '));
+      err.fields = identity.errors;
+      throw err;
+    }
 
     const mime = sniffAudioMime(req.file.buffer);
     if (!mime) throw httpError(415, 'Unsupported audio format. Please record again in your browser.');
@@ -1055,6 +1806,11 @@ app.post('/api/recordings', uploadLimiter, requireStorage, upload.single('audio'
     const duration = clampNumber(Number(req.body.duration), 0, MAX_SECONDS, 0);
     const title = cleanTitle(req.body.title);
     const peaks = parsePeaks(req.body.peaks);
+    const quality = analyzeAudioQuality({
+      duration,
+      peaks,
+      stats: parseQualityStats(req.body.quality),
+    });
     const autoplay = req.body.autoplay === '1' || req.body.autoplay === 'true';
     const code = await allocateCode();
     const createdAt = new Date();
@@ -1062,6 +1818,7 @@ app.post('/api/recordings', uploadLimiter, requireStorage, upload.single('audio'
       ? new Date(createdAt.getTime() + RETENTION_DAYS * 24 * 60 * 60 * 1000)
       : null;
     const deleteToken = crypto.randomBytes(24).toString('base64url');
+    const autoHidden = quality.score < 25;
 
     const meta = {
       code,
@@ -1075,9 +1832,28 @@ app.post('/api/recordings', uploadLimiter, requireStorage, upload.single('audio'
       createdAt: createdAt.toISOString(),
       expiresAt: expiresAt ? expiresAt.toISOString() : null,
       deleteTokenHash: sha256(deleteToken),
+      student: encryptJsonValue(identity.student),
+      moderation: {
+        status: autoHidden ? 'hidden' : 'pending',
+        quality,
+        note: autoHidden ? 'Automatically hidden because the audio quality is very poor.' : '',
+        reviewedAt: '',
+        reviewedBy: '',
+        updatedAt: createdAt.toISOString(),
+      },
     };
 
     await saveRecording(meta, req.file.buffer);
+    touchPresence(req, { page: 'recorder', student: identity.student });
+
+    await logActivity({
+      type: 'recording.created',
+      ip: clientIp(req),
+      student: identity.student,
+      code,
+      title,
+      detail: `Quality ${quality.score}/100 (${quality.label})${autoHidden ? ' · automatically hidden' : ''}`,
+    }).catch((err) => console.warn('Activity log warning:', err.message));
 
     res.status(201).json({
       code,
@@ -1089,13 +1865,16 @@ app.post('/api/recordings', uploadLimiter, requireStorage, upload.single('audio'
       createdAt: meta.createdAt,
       expiresAt: meta.expiresAt,
       deleteToken,
+      moderationStatus: meta.moderation.status,
+      qualityScore: quality.score,
+      underReview: !isPubliclyVisible(meta),
     });
   } catch (err) {
     next(err);
   }
 });
 
-app.delete('/api/recordings/:code', async (req, res, next) => {
+app.delete('/api/recordings/:code', publicApiBlockGate, async (req, res, next) => {
   try {
     const auth = req.get('authorization') || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
@@ -1111,13 +1890,21 @@ app.delete('/api/recordings/:code', async (req, res, next) => {
     }
 
     await removeRecording(meta);
+    await logActivity({
+      type: 'recording.deleted',
+      ip: clientIp(req),
+      student: recordingStudent(meta),
+      code: meta.code,
+      title: meta.title,
+      detail: 'Deleted by the recording owner.',
+    }).catch((err) => console.warn('Activity log warning:', err.message));
     res.status(204).end();
   } catch (err) {
     next(err);
   }
 });
 
-app.get('/api/recordings/:code/qr.png', async (req, res, next) => {
+app.get('/api/recordings/:code/qr.png', publicApiBlockGate, async (req, res, next) => {
   try {
     const code = String(req.params.code);
     if (!CODE_PATTERN.test(code)) throw httpError(404, 'Recording not found.');
@@ -1147,39 +1934,67 @@ app.get('/api/recordings/:code/qr.png', async (req, res, next) => {
   }
 });
 
-app.get('/p/:code', async (req, res) => {
-  const meta = await getPlayableRecording(req.params.code);
-  if (!meta) {
-    res.status(404).type('html').send(renderErrorPage(
-      'This voice note has floated away.',
-      'It may have expired or been deleted. You can record a new one in a few seconds.',
-    ));
-    return;
-  }
-
-  const mediaSources = ["'self'"];
-  if (meta.audioUrl) {
-    try {
-      mediaSources.push(new URL(meta.audioUrl).origin);
-    } catch {
-      // Ignore a malformed legacy URL; the proxied /media path still works.
+app.get('/p/:code', publicPageBlockGate, async (req, res, next) => {
+  try {
+    const meta = await getPlayableRecording(req.params.code);
+    if (!meta) {
+      res.status(404).type('html').send(renderErrorPage(
+        'This voice note has floated away.',
+        'It may have expired or been deleted. You can record a new one in a few seconds.',
+      ));
+      return;
     }
-  }
 
-  res.set({
-    'Cache-Control': 'no-cache',
-    'Content-Security-Policy': `default-src 'self'; img-src 'self' data:; media-src ${mediaSources.join(' ')}; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
-  });
-  res.type('html').send(renderPlayPage(meta, req));
+    if (!isPubliclyVisible(meta)) {
+      const moderation = moderationFor(meta);
+      res.set('Cache-Control', 'no-store');
+      res.status(403).type('html').send(renderErrorPage(
+        moderation.status === 'flagged'
+          ? 'This voice note has been removed.'
+          : 'This voice note is under review.',
+        moderation.status === 'flagged'
+          ? 'An administrator removed this recording after a content review.'
+          : 'An administrator is reviewing this recording before it can be played.',
+      ));
+      return;
+    }
+
+    touchPresence(req, { page: 'player', code: meta.code });
+    await logActivity({
+      type: 'recording.viewed',
+      ip: clientIp(req),
+      student: recordingStudent(meta),
+      code: meta.code,
+      title: meta.title,
+      detail: 'Opened the public player.',
+    }).catch((err) => console.warn('Activity log warning:', err.message));
+
+    const mediaSources = ["'self'"];
+    if (meta.audioUrl) {
+      try {
+        mediaSources.push(new URL(meta.audioUrl).origin);
+      } catch {
+        // Ignore a malformed legacy URL; the proxied /media path still works.
+      }
+    }
+
+    res.set({
+      'Cache-Control': 'no-cache',
+      'Content-Security-Policy': `default-src 'self'; img-src 'self' data:; media-src ${mediaSources.join(' ')}; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+    });
+    res.type('html').send(renderPlayPage(meta, req));
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.get('/media/:code', async (req, res, next) => {
+app.get('/media/:code', publicMediaBlockGate, async (req, res, next) => {
   try {
     const code = String(req.params.code);
     if (!CODE_PATTERN.test(code)) throw httpError(404, 'Recording not found.');
 
     const meta = await getPlayableRecording(code);
-    if (!meta) throw httpError(404, 'Recording not found.');
+    if (!meta || !isPubliclyVisible(meta)) throw httpError(404, 'Recording not found.');
 
     if (STORAGE_MODE === 'blob') {
       if (!meta.audioUrl) throw httpError(404, 'Recording not found.');
@@ -1189,6 +2004,42 @@ app.get('/media/:code', async (req, res, next) => {
     }
 
     await streamLocalAudio(req, res, next, meta, 'public, max-age=31536000, immutable');
+  } catch (err) {
+    next(err);
+  }
+});
+
+const presenceLimiter = createLimiter({
+  limit: 180,
+  windowMs: 5 * 60 * 1000,
+  message: 'Too many presence updates.',
+});
+
+app.post('/api/presence', publicApiBlockGate, presenceLimiter, express.json({ limit: '8kb' }), async (req, res, next) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const page = body.page === 'player' ? 'player' : 'recorder';
+    const code = page === 'player' && CODE_PATTERN.test(String(body.code || ''))
+      ? String(body.code)
+      : '';
+    const record = touchPresence(req, { page, code });
+    if (!record) {
+      res.status(204).end();
+      return;
+    }
+
+    const now = Date.now();
+    if (now - (record.visitLoggedAt || 0) > PRESENCE_LOG_INTERVAL_MS) {
+      record.visitLoggedAt = now;
+      logActivity({
+        type: page === 'player' ? 'visitor.player' : 'visitor.recorder',
+        ip: record.ip,
+        code,
+        detail: page === 'player' ? 'Player page active.' : 'Recorder page active.',
+      }).catch((err) => console.warn('Activity log warning:', err.message));
+    }
+
+    res.json({ ok: true, active: true });
   } catch (err) {
     next(err);
   }
@@ -1219,15 +2070,19 @@ app.get('/api/cron/sweep', async (req, res, next) => {
 /* Admin routes                                                       */
 /* ------------------------------------------------------------------ */
 
-app.get('/admin', requireAdminConfigured, (req, res) => {
-  if (readAdminSession(req)) {
-    adminRedirect(res, '/admin/dashboard');
-    return;
+app.get('/admin', requireAdminConfigured, async (req, res, next) => {
+  try {
+    if (await readAdminSession(req)) {
+      adminRedirect(res, '/admin/dashboard');
+      return;
+    }
+    sendAdminPage(res, 200, renderAdminLoginPage({
+      csrf: issueAdminLoginCsrf(req, res),
+      error: '',
+    }));
+  } catch (err) {
+    next(err);
   }
-  sendAdminPage(res, 200, renderAdminLoginPage({
-    csrf: issueAdminLoginCsrf(req, res),
-    error: '',
-  }));
 });
 
 app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async (req, res, next) => {
@@ -1260,7 +2115,7 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
     const username = typeof body.username === 'string' ? body.username.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
     const account = typeof username === 'string' && username.length <= 80
-      ? ADMIN_ACCOUNTS.get(username)
+      ? await getAdminAccount(username)
       : undefined;
     const passwordOk = password.length <= 256
       ? await verifyPassword(password, account ? account.hash : ADMIN_TIMING_HASH)
@@ -1268,6 +2123,12 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
 
     if (!account || !passwordOk) {
       console.warn(`Admin sign-in failed from ${req.ip || 'unknown'}`);
+      await logActivity({
+        type: 'admin.login_failed',
+        ip: clientIp(req),
+        admin: username.slice(0, 80),
+        detail: 'Incorrect username or password.',
+      }).catch((err) => console.warn('Activity log warning:', err.message));
       sendAdminPage(res, 401, renderAdminLoginPage({
         csrf: issueAdminLoginCsrf(req, res),
         error: 'Incorrect username or password.',
@@ -1277,6 +2138,12 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
 
     loginLimiter.reset(req.ip || 'unknown');
     const session = createAdminSession(account);
+    await logActivity({
+      type: 'admin.login',
+      ip: clientIp(req),
+      admin: account.username,
+      detail: 'Signed in to the admin console.',
+    }).catch((err) => console.warn('Activity log warning:', err.message));
     res.append('Set-Cookie', adminLoginCsrfCookie(req, '', 0));
     res.append('Set-Cookie', adminCookie(req, session.token, Math.floor(ADMIN_SESSION_TTL_MS / 1000)));
     adminRedirect(res, '/admin/dashboard');
@@ -1285,7 +2152,13 @@ app.post('/admin/login', requireAdminConfigured, loginLimiter, adminForm, async 
   }
 });
 
-app.post('/admin/logout', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, (req, res) => {
+app.post('/admin/logout', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res) => {
+  await logActivity({
+    type: 'admin.logout',
+    ip: clientIp(req),
+    admin: req.adminSession.u,
+    detail: 'Signed out of the admin console.',
+  }).catch((err) => console.warn('Activity log warning:', err.message));
   res.append('Set-Cookie', adminCookie(req, '', 0));
   adminRedirect(res, '/admin');
 });
@@ -1329,7 +2202,7 @@ app.get('/admin/dashboard', requireAdminConfigured, requireAdminSession, async (
 
 app.get('/admin/audio/:code', requireAdminConfigured, async (req, res, next) => {
   try {
-    if (!readAdminSession(req)) {
+    if (!(await readAdminSession(req))) {
       res.set('Cache-Control', 'private, no-store').status(401).type('text/plain').send('Sign in to listen.');
       return;
     }
@@ -1377,10 +2250,318 @@ app.post('/admin/recordings/:code/delete', requireAdminConfigured, adminForm, re
     }
 
     await removeRecording(meta);
+    await logActivity({
+      type: 'admin.recording_deleted',
+      ip: clientIp(req),
+      admin: req.adminSession.u,
+      student: recordingStudent(meta),
+      code: meta.code,
+      title: meta.title,
+      detail: 'Deleted permanently from the admin console.',
+    }).catch((err) => console.warn('Activity log warning:', err.message));
     adminRedirect(res, '/admin/dashboard?status=deleted');
   } catch (err) {
     console.error('Admin delete failed:', err);
     adminRedirect(res, '/admin/dashboard?status=error');
+  }
+});
+
+app.get('/admin/screening', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    const filter = ['all', 'review', 'poor', 'hidden', 'flagged', 'approved'].includes(String(req.query.filter || ''))
+      ? String(req.query.filter)
+      : 'review';
+    const query = String(req.query.q || '').trim().slice(0, 80);
+    const status = String(req.query.status || '');
+
+    let recordings = [];
+    let listError = '';
+    if (STORAGE_MODE === 'unavailable') {
+      listError = 'Storage is not connected on this deployment, so recordings cannot be listed.';
+    } else {
+      try {
+        recordings = await listRecordings();
+      } catch (err) {
+        console.error('Could not list recordings for screening:', err);
+        listError = 'Recordings could not be loaded right now. Refresh to try again.';
+      }
+    }
+
+    sendAdminPage(res, 200, renderAdminScreeningPage({
+      recordings,
+      csrf: req.adminSession.csrf,
+      filter,
+      query,
+      status,
+      listError,
+      storageLabel: STORAGE_MODE === 'blob' ? 'Vercel Blob' : STORAGE_MODE === 'file' ? 'Local disk' : 'Not connected',
+    }), mediaOriginsFor(recordings));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/recordings/:code/moderate', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const code = String(req.params.code);
+    const action = String((req.body && req.body.action) || '');
+    const target = { approve: 'approved', hide: 'hidden', flag: 'flagged' }[action];
+    const filter = ['all', 'review', 'poor', 'hidden', 'flagged', 'approved'].includes(String(req.body.filter || ''))
+      ? String(req.body.filter)
+      : 'review';
+
+    if (!target || !CODE_PATTERN.test(code)) {
+      adminRedirect(res, `/admin/screening?status=error&filter=${encodeURIComponent(filter)}`);
+      return;
+    }
+
+    const meta = await readMeta(code);
+    if (!meta) {
+      adminRedirect(res, `/admin/screening?status=missing&filter=${encodeURIComponent(filter)}`);
+      return;
+    }
+
+    const current = moderationFor(meta);
+    const note = String((req.body && req.body.note) || '')
+      .replace(/[\u0000-\u001f\u007f]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 300);
+    const now = new Date().toISOString();
+
+    meta.moderation = {
+      status: target,
+      quality: current.quality,
+      note,
+      reviewedAt: now,
+      reviewedBy: req.adminSession.u,
+      updatedAt: now,
+    };
+    await writeMeta(meta);
+
+    await logActivity({
+      type: `moderation.${target}`,
+      ip: clientIp(req),
+      admin: req.adminSession.u,
+      student: recordingStudent(meta),
+      code: meta.code,
+      title: meta.title,
+      detail: note || `Marked ${MODERATION_LABELS[target].toLowerCase()}.`,
+    }).catch((err) => console.warn('Activity log warning:', err.message));
+
+    adminRedirect(res, `/admin/screening?status=${target}&filter=${encodeURIComponent(filter)}`);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/admin/users', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    const status = String(req.query.status || '');
+    let blocks = [];
+    let activity = [];
+    try {
+      [blocks, activity] = await Promise.all([
+        readBlocks({ force: true }),
+        listActivityEntries(200),
+      ]);
+    } catch (err) {
+      console.warn('Active users data warning:', err.message);
+    }
+
+    const recentByIp = new Map();
+    for (const entry of activity) {
+      const ip = normalizeIp(entry.ip);
+      if (!ip || recentByIp.has(ip)) continue;
+      recentByIp.set(ip, {
+        ip,
+        lastSeen: entry.at,
+        detail: entry.detail || entry.type || 'Public interaction',
+      });
+    }
+
+    sendAdminPage(res, 200, renderAdminUsersPage({
+      csrf: req.adminSession.csrf,
+      presence: listPresence(),
+      blocks,
+      recent: [...recentByIp.values()].slice(0, 40),
+      currentIp: clientIp(req),
+      status,
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/blocks', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const ip = String((req.body && req.body.ip) || '').trim();
+    const reason = String((req.body && req.body.reason) || '');
+    try {
+      const record = await addIpBlock({
+        ip,
+        reason,
+        blockedBy: req.adminSession.u,
+      });
+      await logActivity({
+        type: 'ip.blocked',
+        ip: record.ip,
+        admin: req.adminSession.u,
+        detail: record.reason,
+      }).catch((err) => console.warn('Activity log warning:', err.message));
+      adminRedirect(res, '/admin/users?status=blocked');
+    } catch (err) {
+      const status = err.status === 409 ? 'block-exists' : 'block-invalid';
+      adminRedirect(res, `/admin/users?status=${status}`);
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/blocks/:ip/unblock', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const ip = String(req.params.ip || '');
+    try {
+      const record = await removeIpBlock(ip);
+      if (!record) {
+        adminRedirect(res, '/admin/users?status=unblock-missing');
+        return;
+      }
+      await logActivity({
+        type: 'ip.unblocked',
+        ip: record.ip,
+        admin: req.adminSession.u,
+        detail: record.reason,
+      }).catch((err) => console.warn('Activity log warning:', err.message));
+      adminRedirect(res, '/admin/users?status=unblocked');
+    } catch {
+      adminRedirect(res, '/admin/users?status=unblock-error');
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/admin/admins', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    const admins = await listAdminAccounts();
+    sendAdminPage(res, 200, renderAdminManagementPage({
+      csrf: req.adminSession.csrf,
+      admins,
+      currentUsername: req.adminSession.u,
+      status: String(req.query.status || ''),
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/admins', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const validation = validateNewAdmin({
+      username: req.body && req.body.username,
+      password: req.body && req.body.password,
+      confirmPassword: req.body && req.body.confirmPassword,
+    });
+    if (!validation.ok) {
+      adminRedirect(res, '/admin/admins?status=admin-invalid');
+      return;
+    }
+
+    try {
+      const record = await addDynamicAdmin({
+        username: validation.username,
+        password: validation.password,
+        createdBy: req.adminSession.u,
+      });
+      await logActivity({
+        type: 'admin.added',
+        ip: clientIp(req),
+        admin: req.adminSession.u,
+        detail: `Added administrator ${record.username}.`,
+      }).catch((err) => console.warn('Activity log warning:', err.message));
+      adminRedirect(res, '/admin/admins?status=admin-added');
+    } catch (err) {
+      const status = err.status === 409 ? 'admin-exists' : 'admin-error';
+      adminRedirect(res, `/admin/admins?status=${status}`);
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/admins/:username/remove', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const username = String(req.params.username || '');
+    if (username === req.adminSession.u) {
+      adminRedirect(res, '/admin/admins?status=admin-self');
+      return;
+    }
+
+    try {
+      const account = await removeDynamicAdmin(username);
+      await logActivity({
+        type: 'admin.removed',
+        ip: clientIp(req),
+        admin: req.adminSession.u,
+        detail: `Removed administrator ${account.username}.`,
+      }).catch((err) => console.warn('Activity log warning:', err.message));
+      adminRedirect(res, '/admin/admins?status=admin-removed');
+    } catch (err) {
+      const status = err.status === 403 ? 'admin-protected' : err.status === 404 ? 'admin-missing' : 'admin-error';
+      adminRedirect(res, `/admin/admins?status=${status}`);
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/admin/activity', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    const category = ['all', 'visitors', 'recordings', 'moderation', 'security', 'admins'].includes(String(req.query.category || ''))
+      ? String(req.query.category)
+      : 'all';
+    const query = String(req.query.q || '').trim().slice(0, 100);
+    let entries = [];
+    let listError = '';
+    try {
+      entries = await listActivityEntries(300);
+    } catch (err) {
+      console.warn('Activity load warning:', err.message);
+      listError = 'The activity log could not be loaded right now.';
+    }
+
+    const matchesCategory = (entry) => category === 'all' || activityCategory(entry.type) === category;
+    const needle = query.toLowerCase();
+    const filtered = entries.filter((entry) => {
+      if (!matchesCategory(entry)) return false;
+      if (!needle) return true;
+      const haystack = [
+        activityLabel(entry.type),
+        entry.type,
+        entry.ip,
+        entry.admin,
+        entry.code,
+        entry.title,
+        entry.detail,
+        entry.student && entry.student.name,
+        entry.student && entry.student.id,
+        entry.student && entry.student.grade,
+      ].filter(Boolean).join(' ').toLowerCase();
+      return haystack.includes(needle);
+    });
+
+    sendAdminPage(res, 200, renderAdminActivityPage({
+      csrf: req.adminSession.csrf,
+      entries: filtered,
+      total: entries.length,
+      category,
+      query,
+      listError,
+    }));
+  } catch (err) {
+    next(err);
   }
 });
 
@@ -1391,6 +2572,10 @@ app.use('/admin', (req, res) => {
     '/admin',
     'Back to the console',
   ));
+});
+
+app.get(['/', '/index.html'], publicPageBlockGate, (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
 app.use(express.static(PUBLIC_DIR, { index: 'index.html', maxAge: 0 }));
@@ -1420,7 +2605,14 @@ app.use((err, req, res, next) => {
   const status = Number(err.status) || 500;
   if (status >= 500) console.error(err);
   if (req.path.startsWith('/api/')) {
-    res.status(status).json({ error: status >= 500 ? 'Something went wrong on the server.' : err.message });
+    const payload = { error: status >= 500 ? 'Something went wrong on the server.' : err.message };
+    if (Array.isArray(err.fields) && err.fields.length) payload.fields = err.fields;
+    if (err.blocked) {
+      payload.blocked = true;
+      payload.reason = err.reason || '';
+      payload.blockedAt = err.blockedAt || '';
+    }
+    res.status(status).json(payload);
     return;
   }
   if (req.path.startsWith('/admin/audio/')) {
@@ -1494,11 +2686,26 @@ function renderPlayPage(meta, req) {
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/play.css">
 </head>
-<body data-autoplay="${autoplay ? '1' : '0'}" data-duration="${Number(meta.duration) || 0}">
+<body data-autoplay="${autoplay ? '1' : '0'}" data-duration="${Number(meta.duration) || 0}" data-code="${escapeHtml(meta.code)}">
   <div class="aurora" aria-hidden="true">
     <span class="aurora-blob blob-a"></span>
     <span class="aurora-blob blob-b"></span>
     <span class="aurora-blob blob-c"></span>
+  </div>
+
+  <div class="player-blocked" id="playerBlocked" role="alert" hidden>
+    <div class="player-blocked-card">
+      <span class="player-blocked-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10" width="15" height="10.5" rx="2.5"/>
+          <path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v3"/>
+        </svg>
+      </span>
+      <p class="eyebrow">Access blocked</p>
+      <h2>An administrator blocked this connection.</h2>
+      <p id="playerBlockedReason">This IP address cannot use EchoTag right now.</p>
+      <p class="player-blocked-help">Contact the administrator if you believe this is a mistake.</p>
+    </div>
   </div>
 
   <main class="shell">
@@ -1732,6 +2939,668 @@ function renderAdminLoginPage({ csrf, error }) {
 </html>`;
 }
 
+const ADMIN_NAV_ITEMS = Object.freeze([
+  { id: 'dashboard', label: 'Recordings', href: '/admin/dashboard' },
+  { id: 'screening', label: 'Screening', href: '/admin/screening' },
+  { id: 'users', label: 'Active users', href: '/admin/users' },
+  { id: 'admins', label: 'Administrators', href: '/admin/admins' },
+  { id: 'activity', label: 'Activity log', href: '/admin/activity' },
+]);
+
+function adminNavHtml(active) {
+  return `<nav class="admin-nav" aria-label="Admin sections">
+    ${ADMIN_NAV_ITEMS.map((item) => `<a class="admin-nav-link${item.id === active ? ' is-active' : ''}" href="${item.href}"${item.id === active ? ' aria-current="page"' : ''}>${escapeHtml(item.label)}</a>`).join('')}
+  </nav>`;
+}
+
+function renderAdminPageFrame({ title, csrf, active, refreshHref, content }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>${escapeHtml(title)} · ${APP_NAME} admin</title>
+  <meta name="description" content="Private EchoTag admin console.">
+  <meta name="theme-color" content="#08080d">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <div class="admin-aurora" aria-hidden="true"><span></span><span></span></div>
+  <header class="admin-header admin-header-wide">
+    <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
+    <div class="admin-header-actions">
+      <span class="header-note">Private console</span>
+      <a class="button ghost small" href="${escapeHtml(refreshHref || '/admin/dashboard')}">Refresh</a>
+      <form class="inline-form" method="post" action="/admin/logout">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <button class="button ghost small" type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+  ${adminNavHtml(active)}
+
+  <main class="admin-shell">
+    ${content}
+    <footer class="admin-footer">
+      <p>© Sinsana Studio 2026 · All rights reserved.</p>
+      <p><a href="/">EchoTag home</a></p>
+    </footer>
+  </main>
+  <script src="/admin.js" defer></script>
+</body>
+</html>`;
+}
+
+function renderAdminStatus(status, messages) {
+  if (!status || !messages[status]) return '';
+  const success = /(?:deleted|approved|blocked|unblocked|added|removed|updated)/.test(status);
+  return `<p class="alert ${success ? 'alert-ok' : 'alert-warn'}" role="status">${escapeHtml(messages[status])}</p>`;
+}
+
+function relativeTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const time = date.getTime();
+  if (!Number.isFinite(time)) return 'Unknown';
+  const diff = Date.now() - time;
+  if (diff < 45_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.max(1, Math.round(diff / 60_000))} min ago`;
+  if (diff < 86_400_000) return `${Math.max(1, Math.round(diff / 3_600_000))} hr ago`;
+  return formatDateTime(date.toISOString());
+}
+
+function moderationBadge(meta) {
+  const status = moderationFor(meta).status;
+  return `<span class="badge badge-${status}">${escapeHtml(MODERATION_LABELS[status])}</span>`;
+}
+
+function qualityBadge(quality) {
+  const score = Number(quality && quality.score);
+  if (!Number.isFinite(score)) return '<span class="badge badge-muted">No quality analysis</span>';
+  const tone = score >= 75 ? 'good' : score >= 50 ? 'fair' : 'poor';
+  return `<span class="badge badge-quality-${tone}">Quality ${Math.round(score)}/100</span>`;
+}
+
+function renderStudentIdentity(meta, { compact = true } = {}) {
+  const student = recordingStudent(meta);
+  if (!student) return '<span class="identity-chip identity-missing">No identity on file</span>';
+  if (compact) {
+    return `<span class="identity-chip">${escapeHtml(student.name)} · ${escapeHtml(student.id)} · ${escapeHtml(student.grade)}</span>`;
+  }
+  return `<span class="identity-chip"><strong>${escapeHtml(student.name)}</strong><span>${escapeHtml(student.id)}</span><span>${escapeHtml(student.grade)}</span></span>`;
+}
+
+function activityCategory(type) {
+  const value = String(type || '');
+  if (value === 'admin.recording_deleted') return 'recordings';
+  if (value.startsWith('moderation.')) return 'moderation';
+  if (value.startsWith('ip.') || value === 'admin.login_failed') return 'security';
+  if (value.startsWith('admin.')) return 'admins';
+  if (value === 'recording.viewed' || value.startsWith('visitor.')) return 'visitors';
+  if (value.startsWith('recording.')) return 'recordings';
+  return 'other';
+}
+
+const ACTIVITY_LABELS = Object.freeze({
+  'recording.created': 'Recording created',
+  'recording.viewed': 'Player opened',
+  'recording.deleted': 'Recording deleted by owner',
+  'admin.recording_deleted': 'Recording deleted by admin',
+  'moderation.approved': 'Recording approved',
+  'moderation.hidden': 'Recording hidden',
+  'moderation.flagged': 'Recording flagged',
+  'admin.login': 'Admin signed in',
+  'admin.login_failed': 'Admin sign-in failed',
+  'admin.logout': 'Admin signed out',
+  'admin.added': 'Administrator added',
+  'admin.removed': 'Administrator removed',
+  'ip.blocked': 'IP address blocked',
+  'ip.unblocked': 'IP address unblocked',
+  'visitor.recorder': 'Recorder page active',
+  'visitor.player': 'Player page active',
+});
+
+const ACTIVITY_CATEGORY_LABELS = Object.freeze({
+  all: 'All events',
+  visitors: 'Visitors',
+  recordings: 'Recordings',
+  moderation: 'Moderation',
+  security: 'Security',
+  admins: 'Administrators',
+});
+
+function activityLabel(type) {
+  return ACTIVITY_LABELS[type] || String(type || 'Activity');
+}
+
+function renderBlockedPage(block) {
+  const blockedAt = block && block.blockedAt ? formatDateTime(block.blockedAt) : '';
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Access blocked · ${APP_NAME}</title>
+  <meta name="theme-color" content="#08080d">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/play.css">
+</head>
+<body class="error-page">
+  <div class="aurora" aria-hidden="true">
+    <span class="aurora-blob blob-a"></span>
+    <span class="aurora-blob blob-b"></span>
+  </div>
+  <main class="error-shell">
+    <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
+    <div class="error-card">
+      <div class="error-orb blocked-orb" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10" width="15" height="10.5" rx="2.5"/>
+          <path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v3"/>
+        </svg>
+      </div>
+      <p class="eyebrow">Access blocked</p>
+      <h1>Blocked by an administrator</h1>
+      <p class="error-copy">This IP address cannot use EchoTag right now.</p>
+      <p class="blocked-reason"><span>Reason</span>${escapeHtml(block && block.reason ? block.reason : 'No reason provided.')}</p>
+      ${blockedAt ? `<p class="blocked-time">Blocked ${escapeHtml(blockedAt)}</p>` : ''}
+      <p class="blocked-help">If you believe this is a mistake, contact the administrator of this EchoTag site.</p>
+    </div>
+    <p class="error-copyright">© Sinsana Studio 2026 · All rights reserved.</p>
+  </main>
+</body>
+</html>`;
+}
+
+function renderAdminScreeningPage({ recordings, csrf, filter, query, status, listError, storageLabel }) {
+  const counts = { all: recordings.length, review: 0, poor: 0, hidden: 0, flagged: 0, approved: 0 };
+  for (const meta of recordings) {
+    const moderation = moderationFor(meta);
+    if (moderation.status === 'pending') counts.review += 1;
+    if (moderation.quality && Number(moderation.quality.score) < 60) counts.poor += 1;
+    if (moderation.status === 'hidden') counts.hidden += 1;
+    if (moderation.status === 'flagged') counts.flagged += 1;
+    if (moderation.status === 'approved') counts.approved += 1;
+  }
+
+  const needle = query.toLowerCase();
+  const filtered = recordings.filter((meta) => {
+    const moderation = moderationFor(meta);
+    if (filter === 'review' && moderation.status !== 'pending') return false;
+    if (filter === 'poor' && !(moderation.quality && Number(moderation.quality.score) < 60)) return false;
+    if (filter === 'hidden' && moderation.status !== 'hidden') return false;
+    if (filter === 'flagged' && moderation.status !== 'flagged') return false;
+    if (filter === 'approved' && moderation.status !== 'approved') return false;
+    if (!needle) return true;
+    const student = recordingStudent(meta);
+    const haystack = [
+      meta.title,
+      meta.code,
+      moderation.status,
+      moderation.quality && moderation.quality.reasons && moderation.quality.reasons.join(' '),
+      student && student.name,
+      student && student.id,
+      student && student.grade,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return haystack.includes(needle);
+  });
+
+  const statusMessages = {
+    approved: 'The recording is approved and publicly playable.',
+    hidden: 'The recording is hidden from public playback.',
+    flagged: 'The recording is flagged and hidden from public playback.',
+    updated: 'The review status was updated.',
+    missing: 'That recording was already gone.',
+    error: 'The review action could not be saved. Try again.',
+  };
+  const filterLabels = {
+    review: 'Needs review',
+    poor: 'Poor quality',
+    hidden: 'Hidden',
+    flagged: 'Flagged',
+    approved: 'Approved',
+    all: 'All recordings',
+  };
+  const filterLinks = Object.entries(filterLabels).map(([key, label]) => {
+    const href = `/admin/screening?filter=${key}${query ? `&q=${encodeURIComponent(query)}` : ''}`;
+    return `<a class="filter-chip${filter === key ? ' is-active' : ''}" href="${href}">${escapeHtml(label)} <span>${counts[key]}</span></a>`;
+  }).join('');
+
+  const rows = filtered.map((meta) => {
+    const moderation = moderationFor(meta);
+    const quality = moderation.quality;
+    const student = recordingStudent(meta);
+    const reasons = quality && Array.isArray(quality.reasons) && quality.reasons.length
+      ? quality.reasons.join(' · ')
+      : 'No quality problems detected.';
+    const search = escapeHtml([
+      meta.title,
+      meta.code,
+      moderation.status,
+      student && student.name,
+      student && student.id,
+      student && student.grade,
+      reasons,
+    ].filter(Boolean).join(' ').toLowerCase());
+    const confirmText = `Delete &quot;${escapeHtml(meta.title || 'Voice note')}&quot; permanently?`;
+
+    return `<article class="screening-card" data-search="${search}">
+      <div class="screening-head">
+        <div>
+          <h3 class="recording-title">${escapeHtml(meta.title || 'Voice note')}</h3>
+          <p class="recording-meta">
+            <span class="code-pill">${escapeHtml(meta.code)}</span>
+            <span>${escapeHtml(formatDateTime(meta.createdAt))}</span>
+            <span>${meta.duration ? escapeHtml(formatDuration(meta.duration)) : '—'}</span>
+            <span>${escapeHtml(formatBytes(meta.size))}</span>
+          </p>
+        </div>
+        <div class="badge-row">
+          ${moderationBadge(meta)}
+          ${qualityBadge(quality)}
+        </div>
+      </div>
+      <p class="screening-identity">${renderStudentIdentity(meta, { compact: false })}</p>
+      <p class="quality-reasons ${quality && quality.score < 50 ? 'is-poor' : ''}">${escapeHtml(reasons)}</p>
+      ${moderation.note ? `<p class="review-note"><strong>Review note:</strong> ${escapeHtml(moderation.note)}</p>` : ''}
+      ${moderation.reviewedBy ? `<p class="review-meta">Reviewed by ${escapeHtml(moderation.reviewedBy)} · ${escapeHtml(relativeTime(moderation.reviewedAt))}</p>` : ''}
+      <audio controls preload="none" src="/admin/audio/${encodeURIComponent(meta.code)}"></audio>
+      <div class="screening-actions">
+        <form class="moderation-form" method="post" action="/admin/recordings/${encodeURIComponent(meta.code)}/moderate">
+          <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+          <input type="hidden" name="filter" value="${escapeHtml(filter)}">
+          <input class="note-input" type="text" name="note" maxlength="300" placeholder="Review note (optional)" aria-label="Review note for ${escapeHtml(meta.title || 'voice note')}">
+          <button class="button small approve" name="action" value="approve" type="submit">Approve</button>
+          <button class="button small" name="action" value="hide" type="submit">Hide</button>
+          <button class="button small danger" name="action" value="flag" type="submit">Flag inappropriate</button>
+        </form>
+        <a class="button ghost small" href="/p/${encodeURIComponent(meta.code)}" target="_blank" rel="noopener">Open player</a>
+        <form method="post" action="/admin/recordings/${encodeURIComponent(meta.code)}/delete" data-confirm="${confirmText}">
+          <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+          <button class="button danger small" type="submit">Delete</button>
+        </form>
+      </div>
+    </article>`;
+  }).join('');
+
+  const content = `
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Audio screening</p>
+      <h1>Listen. Then decide.</h1>
+      <p class="hero-copy">Recordings are scored automatically for silence, low signal, short clips, and clipping. Hidden and flagged notes are removed from public playback. Storage: <strong>${escapeHtml(storageLabel)}</strong>.</p>
+      <div class="stats stats-five">
+        <div class="stat"><span>Needs review</span><strong>${counts.review}</strong></div>
+        <div class="stat"><span>Poor quality</span><strong>${counts.poor}</strong></div>
+        <div class="stat"><span>Hidden</span><strong>${counts.hidden}</strong></div>
+        <div class="stat"><span>Flagged</span><strong>${counts.flagged}</strong></div>
+        <div class="stat"><span>Approved</span><strong>${counts.approved}</strong></div>
+      </div>
+    </section>
+
+    ${renderAdminStatus(status, statusMessages)}
+    ${listError ? `<p class="alert alert-warn" role="alert">${escapeHtml(listError)}</p>` : ''}
+
+    <section class="panel">
+      <div class="toolbar toolbar-stack">
+        <div>
+          <h2>Review queue</h2>
+          <p>${filtered.length} of ${recordings.length} recordings shown</p>
+        </div>
+        <form class="search" method="get" action="/admin/screening" role="search">
+          <input type="hidden" name="filter" value="${escapeHtml(filter)}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input type="search" name="q" value="${escapeHtml(query)}" placeholder="Search name, ID, title, or code" autocomplete="off">
+        </form>
+      </div>
+      <div class="filter-row">${filterLinks}</div>
+      <div class="screening-list">
+        ${rows || `<div class="empty-state">
+          <div class="empty-orb" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 3v10M8 7v4M16 7v4M5 13a7 7 0 0 0 14 0M12 20v1"/></svg>
+          </div>
+          <h3>Nothing in this queue</h3>
+          <p>Try another filter, clear the search, or wait for new recordings.</p>
+          <a class="button ghost small" href="/admin/screening?filter=all">Show all recordings</a>
+        </div>`}
+      </div>
+    </section>`;
+
+  return renderAdminPageFrame({
+    title: 'Audio screening',
+    csrf,
+    active: 'screening',
+    refreshHref: `/admin/screening?filter=${encodeURIComponent(filter)}${query ? `&q=${encodeURIComponent(query)}` : ''}`,
+    content,
+  });
+}
+
+function renderAdminUsersPage({ csrf, presence, blocks, recent, currentIp, status }) {
+  const statusMessages = {
+    blocked: 'The IP address is now blocked. Public EchoTag access from that address will show the block notice.',
+    'block-exists': 'That IP address is already blocked.',
+    'block-invalid': 'Enter a valid IP address and a reason of at least 3 characters.',
+    unblocked: 'The IP address was unblocked.',
+    'unblock-missing': 'That IP address was not in the block list.',
+    'unblock-error': 'The IP address could not be unblocked. Try again.',
+  };
+  const blockMap = new Map(blocks.map((block) => [normalizeIp(block.ip), block]));
+  const activeNow = presence.filter((record) => record.active).length;
+
+  const presenceRows = presence.map((record) => {
+    const block = blockMap.get(record.ip);
+    const student = record.student;
+    return `<tr>
+      <td>
+        <span class="ip-pill">${escapeHtml(record.ip)}</span>
+        ${record.ip === currentIp ? '<span class="self-tag">You</span>' : ''}
+        ${block ? '<span class="badge badge-flagged">Blocked</span>' : '<span class="badge badge-active">Active</span>'}
+      </td>
+      <td>${escapeHtml(record.page === 'player' ? (record.code ? `Player · ${record.code}` : 'Player') : 'Recorder')}</td>
+      <td>${student ? escapeHtml(`${student.name} · ${student.id} · ${student.grade}`) : '<span class="muted-text">Not submitted</span>'}</td>
+      <td><span title="${escapeHtml(record.userAgent)}">${escapeHtml(record.userAgent ? record.userAgent.slice(0, 46) : 'Unknown device')}${record.userAgent && record.userAgent.length > 46 ? '…' : ''}</span></td>
+      <td>${escapeHtml(relativeTime(record.lastSeen))}</td>
+      <td>
+        ${block
+          ? `<form method="post" action="/admin/blocks/${encodeURIComponent(record.ip)}/unblock">
+              <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+              <button class="button ghost small" type="submit">Unblock</button>
+            </form>`
+          : `<form class="inline-block-form" method="post" action="/admin/blocks">
+              <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="ip" value="${escapeHtml(record.ip)}">
+              <input class="reason-input" type="text" name="reason" minlength="3" maxlength="200" placeholder="Reason required" required aria-label="Reason for blocking ${escapeHtml(record.ip)}">
+              <button class="button danger small" type="submit">Block IP</button>
+            </form>`}
+      </td>
+    </tr>`;
+  }).join('');
+
+  const recentRows = recent.filter((entry) => !presence.some((record) => record.ip === entry.ip)).map((entry) => {
+    const block = blockMap.get(entry.ip);
+    return `<tr>
+      <td><span class="ip-pill">${escapeHtml(entry.ip)}</span> ${block ? '<span class="badge badge-flagged">Blocked</span>' : ''}</td>
+      <td>${escapeHtml(entry.detail)}</td>
+      <td>${escapeHtml(relativeTime(entry.lastSeen))}</td>
+      <td>
+        ${block
+          ? `<form method="post" action="/admin/blocks/${encodeURIComponent(entry.ip)}/unblock">
+              <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+              <button class="button ghost small" type="submit">Unblock</button>
+            </form>`
+          : `<form class="inline-block-form" method="post" action="/admin/blocks">
+              <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+              <input type="hidden" name="ip" value="${escapeHtml(entry.ip)}">
+              <input class="reason-input" type="text" name="reason" minlength="3" maxlength="200" placeholder="Reason required" required aria-label="Reason for blocking ${escapeHtml(entry.ip)}">
+              <button class="button danger small" type="submit">Block IP</button>
+            </form>`}
+      </td>
+    </tr>`;
+  }).join('');
+
+  const blockedRows = blocks.map((block) => `<tr>
+    <td><span class="ip-pill">${escapeHtml(block.ip)}</span></td>
+    <td>${escapeHtml(block.reason)}</td>
+    <td>${escapeHtml(block.blockedBy || 'Administrator')}</td>
+    <td>${escapeHtml(relativeTime(block.blockedAt))}</td>
+    <td>
+      <form method="post" action="/admin/blocks/${encodeURIComponent(block.ip)}/unblock">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <button class="button ghost small" type="submit">Unblock</button>
+      </form>
+    </td>
+  </tr>`).join('');
+
+  const content = `
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Access control</p>
+      <h1>Who is here right now.</h1>
+      <p class="hero-copy">Active visitors are tracked by IP address from recorder and player heartbeats. Blocking requires a reason, and blocked visitors see a notice naming the administrator’s action. Your current IP is <strong>${escapeHtml(currentIp)}</strong>.</p>
+      <div class="stats">
+        <div class="stat"><span>Active now</span><strong>${activeNow}</strong></div>
+        <div class="stat"><span>Tracked visitors</span><strong>${presence.length}</strong></div>
+        <div class="stat"><span>Blocked IPs</span><strong>${blocks.length}</strong></div>
+        <div class="stat"><span>Recent IPs</span><strong>${recent.length}</strong></div>
+      </div>
+    </section>
+
+    ${renderAdminStatus(status, statusMessages)}
+
+    <section class="panel panel-pad">
+      <div class="toolbar toolbar-bare">
+        <div>
+          <h2>Block an IP address</h2>
+          <p>The reason is required and is shown to the blocked visitor.</p>
+        </div>
+      </div>
+      <form class="admin-form-grid" method="post" action="/admin/blocks">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <label class="field">
+          <span>IP address</span>
+          <input type="text" name="ip" inputmode="text" spellcheck="false" maxlength="64" placeholder="203.0.113.25" required>
+        </label>
+        <label class="field">
+          <span>Reason (required)</span>
+          <input type="text" name="reason" minlength="3" maxlength="200" placeholder="Repeated inappropriate recordings" required>
+        </label>
+        <button class="button danger" type="submit">Block IP</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Active users</h2>
+          <p>Seen in the last 2 minutes · refreshes when you reload</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        ${presence.length ? `<table class="admin-table">
+          <thead><tr><th>IP address</th><th>Page</th><th>Student</th><th>Device</th><th>Last seen</th><th>Action</th></tr></thead>
+          <tbody>${presenceRows}</tbody>
+        </table>` : `<div class="empty-state"><h3>No active visitors</h3><p>Recorder and player heartbeats will appear here.</p></div>`}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Blocked IP addresses</h2>
+          <p>${blocks.length} ${blocks.length === 1 ? 'address' : 'addresses'} blocked</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        ${blocks.length ? `<table class="admin-table">
+          <thead><tr><th>IP address</th><th>Reason</th><th>Blocked by</th><th>Blocked</th><th>Action</th></tr></thead>
+          <tbody>${blockedRows}</tbody>
+        </table>` : `<div class="empty-state"><h3>No blocked addresses</h3><p>Blocked visitors will be listed here with the reason they were blocked.</p></div>`}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Recent IP addresses</h2>
+          <p>From the activity log, including visitors who are no longer active.</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        ${recentRows ? `<table class="admin-table">
+          <thead><tr><th>IP address</th><th>Last activity</th><th>Last seen</th><th>Action</th></tr></thead>
+          <tbody>${recentRows}</tbody>
+        </table>` : `<div class="empty-state"><h3>No recent activity</h3><p>Visit activity will appear after someone records or opens a player.</p></div>`}
+      </div>
+    </section>`;
+
+  return renderAdminPageFrame({
+    title: 'Active users',
+    csrf,
+    active: 'users',
+    refreshHref: '/admin/users',
+    content,
+  });
+}
+
+function renderAdminManagementPage({ csrf, admins, currentUsername, status }) {
+  const statusMessages = {
+    'admin-added': 'The new administrator can sign in immediately.',
+    'admin-removed': 'The administrator account was removed.',
+    'admin-invalid': 'Check the username and password requirements, then try again.',
+    'admin-exists': 'An administrator with that username already exists.',
+    'admin-self': 'You cannot remove the account you are signed in with.',
+    'admin-protected': 'Built-in administrators come from environment variables and cannot be removed here.',
+    'admin-missing': 'That administrator was already gone.',
+    'admin-error': 'The administrator list could not be updated. Try again.',
+  };
+
+  const rows = admins.map((account) => {
+    const created = account.source === 'added'
+      ? `${escapeHtml(account.createdBy || 'Administrator')} · ${escapeHtml(relativeTime(account.createdAt))}`
+      : 'Configured by environment variables';
+    const action = account.source === 'built-in'
+      ? '<span class="muted-text">Protected</span>'
+      : account.username === currentUsername
+        ? '<span class="muted-text">Current account</span>'
+        : `<form method="post" action="/admin/admins/${encodeURIComponent(account.username)}/remove" data-confirm="Remove administrator ${escapeHtml(account.username)}? They will lose access immediately.">
+            <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+            <button class="button danger small" type="submit">Remove</button>
+          </form>`;
+    return `<tr>
+      <td><strong>${escapeHtml(account.username)}</strong>${account.username === currentUsername ? '<span class="self-tag">You</span>' : ''}</td>
+      <td><span class="badge ${account.source === 'built-in' ? 'badge-approved' : 'badge-pending'}">${account.source === 'built-in' ? 'Built-in' : 'Added'}</span></td>
+      <td>${created}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join('');
+
+  const content = `
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Administrator access</p>
+      <h1>Who can open the console.</h1>
+      <p class="hero-copy">Built-in accounts come from <code>ADMIN_USERNAME</code> and <code>ADMIN_USERS</code>. Added administrators are stored securely and can be removed here. Every account has full access to recordings, blocking, and the activity log.</p>
+    </section>
+
+    ${renderAdminStatus(status, statusMessages)}
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Current administrators</h2>
+          <p>${admins.length} ${admins.length === 1 ? 'account' : 'accounts'}</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="admin-table">
+          <thead><tr><th>Username</th><th>Type</th><th>Added</th><th>Action</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel-pad">
+      <div class="toolbar toolbar-bare">
+        <div>
+          <h2>Add an administrator</h2>
+          <p>Use at least 10 characters. Share the password through a private channel.</p>
+        </div>
+      </div>
+      <form class="admin-form-grid admin-form-grid-compact" method="post" action="/admin/admins" autocomplete="off">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <label class="field">
+          <span>Username</span>
+          <input type="text" name="username" minlength="3" maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,39}" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input type="password" name="password" minlength="10" maxlength="200" autocomplete="new-password" required>
+        </label>
+        <label class="field">
+          <span>Confirm password</span>
+          <input type="password" name="confirmPassword" minlength="10" maxlength="200" autocomplete="new-password" required>
+        </label>
+        <button class="button primary compact-button" type="submit">Add administrator</button>
+      </form>
+    </section>`;
+
+  return renderAdminPageFrame({
+    title: 'Administrators',
+    csrf,
+    active: 'admins',
+    refreshHref: '/admin/admins',
+    content,
+  });
+}
+
+function renderAdminActivityPage({ csrf, entries, total, category, query, listError }) {
+  const filterOptions = Object.entries(ACTIVITY_CATEGORY_LABELS).map(([value, label]) => `<option value="${value}"${category === value ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('');
+
+  const rows = entries.map((entry) => {
+    const student = entry.student;
+    const actor = entry.admin
+      ? `Admin · ${entry.admin}`
+      : student
+        ? `${student.name || 'Student'} · ${student.id || ''}`
+        : 'Visitor';
+    const context = [
+      entry.code ? `Code ${entry.code}` : '',
+      entry.title || '',
+      entry.detail || '',
+    ].filter(Boolean).join(' · ');
+    return `<tr>
+      <td class="activity-time"><span>${escapeHtml(relativeTime(entry.at))}</span><small>${escapeHtml(formatDateTime(entry.at))}</small></td>
+      <td><span class="activity-type activity-${escapeHtml(activityCategory(entry.type))}">${escapeHtml(activityLabel(entry.type))}</span></td>
+      <td>${escapeHtml(actor)}</td>
+      <td><span class="ip-pill">${escapeHtml(entry.ip || 'unknown')}</span></td>
+      <td class="activity-detail">${escapeHtml(context || '—')}</td>
+    </tr>`;
+  }).join('');
+
+  const content = `
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Activity log</p>
+      <h1>Every action, in order.</h1>
+      <p class="hero-copy">Recordings, player visits, moderation decisions, sign-ins, blocks, and administrator changes are recorded with the IP address and account involved. Showing <strong>${entries.length}</strong> of the latest ${total} events.</p>
+    </section>
+
+    ${listError ? `<p class="alert alert-warn" role="alert">${escapeHtml(listError)}</p>` : ''}
+
+    <section class="panel">
+      <div class="toolbar toolbar-stack">
+        <div>
+          <h2>Recent activity</h2>
+          <p>Encrypted at rest and visible only to administrators</p>
+        </div>
+        <form class="activity-filter" method="get" action="/admin/activity" role="search">
+          <select name="category" aria-label="Activity category">${filterOptions}</select>
+          <input type="search" name="q" value="${escapeHtml(query)}" placeholder="Search IP, admin, name, code…" autocomplete="off">
+          <button class="button small" type="submit">Filter</button>
+        </form>
+      </div>
+      <div class="table-wrap">
+        ${entries.length ? `<table class="admin-table activity-table">
+          <thead><tr><th>When</th><th>Event</th><th>Actor</th><th>IP address</th><th>Details</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>` : `<div class="empty-state">
+          <div class="empty-orb" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 7v5l3 2M4 12a8 8 0 1 0 16 0 8 8 0 0 0-16 0Z"/></svg>
+          </div>
+          <h3>No matching activity</h3>
+          <p>Try another category or clear the search.</p>
+          <a class="button ghost small" href="/admin/activity">Show all activity</a>
+        </div>`}
+      </div>
+    </section>`;
+
+  return renderAdminPageFrame({
+    title: 'Activity log',
+    csrf,
+    active: 'activity',
+    refreshHref: '/admin/activity',
+    content,
+  });
+}
+
 function renderAdminRecordingRow(meta, csrf) {
   const code = String(meta.code);
   const title = meta.title || 'Voice note';
@@ -1742,7 +3611,24 @@ function renderAdminRecordingRow(meta, csrf) {
   const expiry = meta.expiresAt
     ? `${expired ? 'Expired' : 'Expires'} ${formatDate(meta.expiresAt)}`
     : 'No expiry';
-  const search = escapeHtml(`${title} ${code}`.toLowerCase());
+  const moderation = moderationFor(meta);
+  const quality = moderation.quality;
+  const student = recordingStudent(meta);
+  const reviewFilter = moderation.status === 'pending'
+    ? 'review'
+    : moderation.status === 'hidden'
+      ? 'hidden'
+      : moderation.status === 'flagged'
+        ? 'flagged'
+        : 'all';
+  const search = escapeHtml([
+    title,
+    code,
+    student && student.name,
+    student && student.id,
+    student && student.grade,
+    moderation.status,
+  ].filter(Boolean).join(' ').toLowerCase());
   const confirmText = `Delete &quot;${escapeHtml(title)}&quot;? This permanently removes the audio and cannot be undone.`;
 
   return `<article class="recording" data-search="${search}">
@@ -1750,7 +3636,10 @@ function renderAdminRecordingRow(meta, csrf) {
       <div class="recording-top">
         <h3 class="recording-title">${escapeHtml(title)}</h3>
         <span class="badge ${expired ? 'badge-expired' : 'badge-active'}">${expired ? 'Expired' : 'Active'}</span>
+        ${moderationBadge(meta)}
+        ${qualityBadge(quality)}
       </div>
+      <p class="recording-identity">${renderStudentIdentity(meta)}</p>
       <p class="recording-meta">
         <span class="code-pill">${escapeHtml(code)}</span>
         <span>${escapeHtml(created)}</span>
@@ -1761,6 +3650,7 @@ function renderAdminRecordingRow(meta, csrf) {
       <audio controls preload="none" src="/admin/audio/${encodeURIComponent(code)}"></audio>
     </div>
     <div class="recording-actions">
+      <a class="button ghost small" href="/admin/screening?filter=${reviewFilter}&q=${encodeURIComponent(code)}">Review</a>
       <a class="button ghost small" href="/p/${encodeURIComponent(code)}" target="_blank" rel="noopener">Open player</a>
       <form method="post" action="/admin/recordings/${encodeURIComponent(code)}/delete" data-confirm="${confirmText}">
         <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
@@ -1775,6 +3665,11 @@ function renderAdminDashboard({ recordings, csrf, status, listError, storageLabe
   const active = recordings.filter((meta) => !(meta.expiresAt && Date.parse(meta.expiresAt) <= now)).length;
   const totalBytes = recordings.reduce((sum, meta) => sum + (Number(meta.size) || 0), 0);
   const totalDuration = recordings.reduce((sum, meta) => sum + (Number(meta.duration) || 0), 0);
+  const needsReview = recordings.filter((meta) => moderationFor(meta).status === 'pending').length;
+  const poorQuality = recordings.filter((meta) => {
+    const quality = moderationFor(meta).quality;
+    return quality && Number(quality.score) < 60;
+  }).length;
   const rows = recordings.map((meta) => renderAdminRecordingRow(meta, csrf)).join('');
 
   const statusMessages = {
@@ -1782,62 +3677,34 @@ function renderAdminDashboard({ recordings, csrf, status, listError, storageLabe
     missing: 'That recording was already gone.',
     error: 'The recording could not be deleted. Please try again.',
   };
-  const statusHtml = status && statusMessages[status]
-    ? `<p class="alert ${status === 'deleted' ? 'alert-ok' : 'alert-warn'}" role="status">${escapeHtml(statusMessages[status])}</p>`
-    : '';
 
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Recordings · ${APP_NAME} admin</title>
-  <meta name="description" content="Private EchoTag admin console.">
-  <meta name="theme-color" content="#08080d">
-  <meta name="robots" content="noindex,nofollow">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/admin.css">
-</head>
-<body>
-  <div class="admin-aurora" aria-hidden="true"><span></span><span></span></div>
-  <header class="admin-header admin-header-wide">
-    <a class="brand" href="/">${brandMark()}<span>${APP_NAME}</span></a>
-    <div class="admin-header-actions">
-      <span class="header-note">Private console</span>
-      <a class="button ghost small" href="/admin/dashboard">Refresh</a>
-      <form class="inline-form" method="post" action="/admin/logout">
-        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
-        <button class="button ghost small" type="submit">Sign out</button>
-      </form>
-    </div>
-  </header>
-
-  <main class="admin-shell">
+  const content = `
     <section class="admin-hero">
       <p class="eyebrow"><span class="eyebrow-dot"></span> Admin console</p>
       <h1>Every voice note.</h1>
-      <p class="hero-copy">Listen to any recording stored on this server, or remove it permanently. Storage: <strong>${escapeHtml(storageLabel)}</strong>.</p>
-      <div class="stats">
+      <p class="hero-copy">Listen to any recording stored on this server, review its identity and quality score, or remove it permanently. Storage: <strong>${escapeHtml(storageLabel)}</strong>.</p>
+      <div class="stats stats-five">
         <div class="stat"><span>Total notes</span><strong>${recordings.length}</strong></div>
         <div class="stat"><span>Active</span><strong>${active}</strong></div>
-        <div class="stat"><span>Audio</span><strong>${escapeHtml(formatBytes(totalBytes))}</strong></div>
+        <div class="stat"><span>Needs review</span><strong>${needsReview}</strong></div>
+        <div class="stat"><span>Poor quality</span><strong>${poorQuality}</strong></div>
         <div class="stat"><span>Play time</span><strong>${escapeHtml(formatDuration(totalDuration))}</strong></div>
       </div>
     </section>
 
-    ${statusHtml}
+    ${renderAdminStatus(status, statusMessages)}
     ${listError ? `<p class="alert alert-warn" role="alert">${escapeHtml(listError)}</p>` : ''}
 
     <section class="panel">
       <div class="toolbar">
         <div>
           <h2>Recordings</h2>
-          <p id="visibleCount" data-total="${recordings.length}">${recordings.length} ${recordings.length === 1 ? 'note' : 'notes'}</p>
+          <p id="visibleCount" data-total="${recordings.length}">${recordings.length} ${recordings.length === 1 ? 'note' : 'notes'} · ${escapeHtml(formatBytes(totalBytes))} audio</p>
         </div>
         <label class="search">
           <span class="sr-only">Search recordings</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          <input id="adminSearch" type="search" placeholder="Search title or code" autocomplete="off">
+          <input id="adminSearch" type="search" placeholder="Search name, ID, title, or code" autocomplete="off">
         </label>
       </div>
 
@@ -1851,16 +3718,15 @@ function renderAdminDashboard({ recordings, csrf, status, listError, storageLabe
           <a class="button ghost small" href="/">Open the recorder</a>
         </div>`}
       </div>
-    </section>
+    </section>`;
 
-    <footer class="admin-footer">
-      <p>© Sinsana Studio 2026 · All rights reserved.</p>
-      <p><a href="/">EchoTag home</a></p>
-    </footer>
-  </main>
-  <script src="/admin.js" defer></script>
-</body>
-</html>`;
+  return renderAdminPageFrame({
+    title: 'Recordings',
+    csrf,
+    active: 'dashboard',
+    refreshHref: '/admin/dashboard',
+    content,
+  });
 }
 
 /* ------------------------------------------------------------------ */

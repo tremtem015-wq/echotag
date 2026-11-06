@@ -17,6 +17,21 @@
   <div class="page-glow" aria-hidden="true"></div>
   <div class="page-grid" aria-hidden="true"></div>
 
+  <div class="blocked-overlay" id="blockedBanner" role="alert" aria-live="assertive" hidden>
+    <div class="blocked-card">
+      <span class="blocked-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10" width="15" height="10.5" rx="2.5"/>
+          <path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v3"/>
+        </svg>
+      </span>
+      <p class="eyebrow">Access blocked</p>
+      <h2>An administrator blocked this connection.</h2>
+      <p id="blockedReason">This IP address cannot use EchoTag right now.</p>
+      <p class="blocked-help">If you believe this is a mistake, contact the administrator of this EchoTag site.</p>
+    </div>
+  </div>
+
   <header class="site-header">
     <a class="brand" href="/" aria-label="EchoTag home">
       <span class="brand-mark" aria-hidden="true">
@@ -50,7 +65,57 @@
         </aside>
       </div>
 
-      <div class="recorder-card" aria-labelledby="recorderHeading">
+      <div class="recorder-stack">
+        <section class="identity-card" aria-labelledby="identityHeading">
+          <div class="identity-head">
+            <p class="section-kicker">Student identity</p>
+            <span class="identity-state" id="identityState" data-state="required">Required</span>
+          </div>
+
+          <div class="identity-warning" role="note">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3 3.7 18a2 2 0 0 0 1.75 3h13.1a2 2 0 0 0 1.75-3L12 3Z"/>
+              <path d="M12 9v5M12 17h.01"/>
+            </svg>
+            <p><strong>Use your real name and school details.</strong> Fake, impersonating, or inappropriate names may be blocked from EchoTag and reported to your school.</p>
+          </div>
+
+          <h2 class="identity-title" id="identityHeading">Who is recording?</h2>
+          <p class="identity-sub">The administrator can see this information with your recording.</p>
+
+          <div class="identity-fields">
+            <label class="field">
+              <span class="field-label">Full name</span>
+              <input id="studentNameInput" type="text" maxlength="80" placeholder="First and last name" autocomplete="name" spellcheck="false" required>
+            </label>
+            <label class="field">
+              <span class="field-label">Student ID</span>
+              <input id="studentIdInput" type="text" maxlength="30" placeholder="e.g. 12345" autocomplete="off" spellcheck="false" required>
+            </label>
+            <label class="field field-grade">
+              <span class="field-label">Grade level</span>
+              <select id="gradeInput" required>
+                <option value="">Select grade</option>
+                <option value="M.1">M.1</option>
+                <option value="M.2">M.2</option>
+                <option value="M.3">M.3</option>
+                <option value="M.4">M.4</option>
+                <option value="M.5">M.5</option>
+                <option value="M.6">M.6</option>
+                <option value="G.7">G.7</option>
+                <option value="G.8">G.8</option>
+                <option value="G.9">G.9</option>
+                <option value="G.10">G.10</option>
+                <option value="G.11">G.11</option>
+                <option value="G.12">G.12</option>
+              </select>
+            </label>
+          </div>
+
+          <p class="identity-hint" id="identityHint">Enter your full name, student ID, and grade to unlock recording.</p>
+        </section>
+
+        <div class="recorder-card" aria-labelledby="recorderHeading">
         <h2 class="sr-only" id="recorderHeading">Voice note recorder</h2>
 
         <div class="card-top">
@@ -70,7 +135,7 @@
 
         <div class="view" id="view-idle">
           <div class="record-stage">
-            <button class="record-button" id="recordBtn" type="button" aria-label="Start recording">
+            <button class="record-button" id="recordBtn" type="button" aria-label="Start recording" aria-describedby="recordLock" disabled>
               <span class="record-pulse" aria-hidden="true"></span>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
                 <rect x="9" y="3" width="6" height="11" rx="3"/>
@@ -80,6 +145,7 @@
           </div>
           <h3 class="view-title">Tap to record</h3>
           <p class="view-sub">Speak naturally. You can preview it before sharing.</p>
+          <p class="record-lock" id="recordLock">Enter your student details above to unlock recording.</p>
           <p class="secure-note" id="secureNote" hidden>Recording needs a secure page. Open this site via <strong>localhost</strong> or <strong>HTTPS</strong> to use your microphone.</p>
         </div>
 
@@ -165,6 +231,7 @@
             <button class="link-button danger" id="deleteBtn" type="button">Delete note</button>
           </div>
         </div>
+      </div>
       </div>
     </section>
 

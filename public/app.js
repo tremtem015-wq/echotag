@@ -5,12 +5,25 @@
   const BASE_KEY = 'echotag:base';
   const HISTORY_KEY = 'echotag:history';
   const DEFAULT_MAX_SECONDS = 300;
+  const PRESENCE_INTERVAL_MS = 45000;
+  const DEFAULT_GRADES = [
+    'M.1', 'M.2', 'M.3', 'M.4', 'M.5', 'M.6',
+    'G.7', 'G.8', 'G.9', 'G.10', 'G.11', 'G.12',
+  ];
 
   const els = {
     statusBadge: $('statusBadge'),
     statusText: $('statusText'),
     errorBanner: $('errorBanner'),
     errorText: $('errorText'),
+    blockedBanner: $('blockedBanner'),
+    blockedReason: $('blockedReason'),
+    studentNameInput: $('studentNameInput'),
+    studentIdInput: $('studentIdInput'),
+    gradeInput: $('gradeInput'),
+    identityState: $('identityState'),
+    identityHint: $('identityHint'),
+    recordLock: $('recordLock'),
     views: {
       idle: $('view-idle'),
       recording: $('view-recording'),
@@ -54,6 +67,7 @@
     retentionDays: 30,
     maxBytes: 25 * 1024 * 1024,
     uploadEnabled: true,
+    grades: DEFAULT_GRADES.slice(),
   };
 
   const state = {
@@ -74,14 +88,20 @@
     levels: [],
     lastLevelAt: 0,
     smoothedLevel: 0,
+    qualitySamples: [],
+    clippedSamples: 0,
+    qualityPeak: 0,
     previewBlob: null,
     previewUrl: null,
     recording: null,
     qrBase: '',
     busy: false,
+    blocked: false,
   };
 
   let toastTimer = 0;
+  let presenceTimer = 0;
+  let presenceBusy = false;
   let canvasCssWidth = 0;
   let canvasCssHeight = 0;
 
@@ -97,6 +117,12 @@
     );
 
     if (!window.isSecureContext) els.secureNote.hidden = false;
+
+    for (const field of [els.studentNameInput, els.studentIdInput, els.gradeInput]) {
+      field.addEventListener('input', updateIdentityGate);
+      field.addEventListener('change', updateIdentityGate);
+      field.addEventListener('blur', updateIdentityGate);
+    }
 
     els.recordBtn.addEventListener('click', startRecording);
     els.stopBtn.addEventListener('click', stopRecording);
@@ -134,13 +160,26 @@
 
     window.addEventListener('beforeunload', revokePreviewUrl);
 
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        sendPresence();
+      }
+    });
+
     renderHistory();
+    updateIdentityGate();
+    startPresence();
     loadConfig();
   }
 
   async function loadConfig() {
     try {
       const response = await fetch('/api/config', { headers: { Accept: 'application/json' } });
+      if (response.status === 403) {
+        const data = await response.json().catch(() => null);
+        if (data && data.blocked) enterBlockedState(data);
+        return;
+      }
       if (!response.ok) return;
       const data = await response.json();
       if (Number.isFinite(data.maxSeconds) && data.maxSeconds > 0) config.maxSeconds = data.maxSeconds;
@@ -148,7 +187,11 @@
       if (Number.isFinite(data.retentionDays)) config.retentionDays = data.retentionDays;
       if (Number.isFinite(data.maxBytes) && data.maxBytes > 0) config.maxBytes = data.maxBytes;
       if (typeof data.uploadEnabled === 'boolean') config.uploadEnabled = data.uploadEnabled;
+      if (Array.isArray(data.grades) && data.grades.length) {
+        config.grades = data.grades.map((grade) => String(grade).toUpperCase());
+      }
       applyConfigToUi();
+      updateIdentityGate();
     } catch {
       // Offline config fetch is non-fatal; the defaults still work.
     }
@@ -167,6 +210,168 @@
     if (!config.uploadEnabled) {
       showError('This deployment is not connected to storage yet. Add a Vercel Blob store, then redeploy.');
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Student identity gate + presence                                   */
+  /* ------------------------------------------------------------------ */
+
+  function readIdentity() {
+    const name = els.studentNameInput.value
+      .replace(/[\u0000-\u001f\u007f]/g, ' ')
+      .replace(/[<>]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+    const id = els.studentIdInput.value
+      .trim()
+      .replace(/\s+/g, '')
+      .toUpperCase()
+      .slice(0, 30);
+    const grade = els.gradeInput.value.trim().toUpperCase();
+    const errors = [];
+
+    if (name.length < 2) {
+      errors.push('Enter your full name.');
+    } else if (!/\p{L}/u.test(name)) {
+      errors.push('Your name must contain letters.');
+    } else if (!/^[\p{L}\p{M} .'’\-]+$/u.test(name)) {
+      errors.push('Use letters, spaces, hyphens, apostrophes, or periods in your name.');
+    }
+
+    if (!/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(id)) {
+      errors.push('Enter your student ID (3–30 letters, numbers, dots, dashes, or slashes).');
+    }
+
+    if (!config.grades.includes(grade)) {
+      errors.push('Select your grade level.');
+    }
+
+    return {
+      ok: errors.length === 0,
+      errors,
+      student: { name, id, grade },
+    };
+  }
+
+  function updateIdentityGate() {
+    const identity = readIdentity();
+    const hasAny = Boolean(
+      els.studentNameInput.value.trim()
+      || els.studentIdInput.value.trim()
+      || els.gradeInput.value,
+    );
+
+    if (identity.ok) {
+      els.identityState.textContent = 'Ready';
+      els.identityState.dataset.state = 'ready';
+      els.identityHint.textContent = 'Identity complete. Recording is unlocked.';
+      els.recordLock.textContent = 'Recording unlocked for this student identity.';
+    } else {
+      els.identityState.textContent = hasAny ? 'Incomplete' : 'Required';
+      els.identityState.dataset.state = hasAny ? 'incomplete' : 'required';
+      els.identityHint.textContent = hasAny
+        ? identity.errors[0]
+        : 'Enter your full name, student ID, and grade to unlock recording.';
+      els.recordLock.textContent = 'Enter your student details above to unlock recording.';
+    }
+
+    els.recordLock.classList.toggle('is-ready', identity.ok);
+    els.recordBtn.disabled = !identity.ok || state.blocked;
+    return identity;
+  }
+
+  function focusFirstIdentityField() {
+    const fallback = els.studentNameInput;
+    const target = els.studentNameInput.value.trim().length < 2
+      ? els.studentNameInput
+      : !/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(els.studentIdInput.value.trim().replace(/\s+/g, '').toUpperCase())
+        ? els.studentIdInput
+        : !config.grades.includes(els.gradeInput.value.trim().toUpperCase())
+          ? els.gradeInput
+          : fallback;
+    if (target && typeof target.focus === 'function') target.focus();
+  }
+
+  function ensureIdentity() {
+    const identity = updateIdentityGate();
+    if (identity.ok) return identity;
+    showError(identity.errors[0]);
+    focusFirstIdentityField();
+    return null;
+  }
+
+  function startPresence() {
+    window.clearInterval(presenceTimer);
+    sendPresence();
+    presenceTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') sendPresence();
+    }, PRESENCE_INTERVAL_MS);
+  }
+
+  async function sendPresence() {
+    if (state.blocked || presenceBusy) return;
+    presenceBusy = true;
+    try {
+      const response = await fetch('/api/presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ page: 'recorder' }),
+      });
+      if (response.status === 403) {
+        const data = await response.json().catch(() => null);
+        if (data && data.blocked) enterBlockedState(data);
+      }
+    } catch {
+      // Presence is best-effort; recording still works when the heartbeat fails.
+    } finally {
+      presenceBusy = false;
+    }
+  }
+
+  function enterBlockedState(data) {
+    if (state.blocked) return;
+    state.blocked = true;
+    window.clearInterval(presenceTimer);
+    presenceTimer = 0;
+
+    if (state.recorder && state.recorder.state !== 'inactive') {
+      state.discardOnStop = true;
+      try {
+        state.recorder.stop();
+      } catch {
+        // The page is locking anyway.
+      }
+    }
+
+    stopMeter();
+    stopStream();
+    window.clearInterval(state.timerId);
+    state.timerId = 0;
+    els.recordBtn.disabled = true;
+    document.body.classList.add('is-blocked');
+
+    if (data && data.reason) {
+      els.blockedReason.textContent = `An administrator blocked this IP address. Reason: ${data.reason}`;
+    } else {
+      els.blockedReason.textContent = 'An administrator blocked this IP address. Contact the administrator if you believe this is a mistake.';
+    }
+    els.blockedBanner.hidden = false;
+    if (data && data.reason) toast(`Blocked by an administrator: ${data.reason}`, 'error');
+  }
+
+  function qualityStats() {
+    const samples = state.qualitySamples;
+    if (!samples.length) return null;
+    const average = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+    const silenceRatio = samples.filter((value) => value < 0.004).length / samples.length;
+    return {
+      averageLevel: Math.round(average * 10000) / 10000,
+      peakLevel: Math.round(state.qualityPeak * 10000) / 10000,
+      silenceRatio: Math.round(silenceRatio * 1000) / 1000,
+      clippingRatio: Math.round((state.clippedSamples / samples.length) * 1000) / 1000,
+      samples: samples.length,
+    };
   }
 
   /* ------------------------------------------------------------------ */
@@ -227,6 +432,13 @@
   async function startRecording() {
     clearError();
 
+    if (state.blocked) {
+      showError('An administrator has blocked this IP address.');
+      return;
+    }
+
+    if (!ensureIdentity()) return;
+
     if (!window.isSecureContext) {
       showError('Microphone access needs a secure page. Open this site via localhost or HTTPS.');
       return;
@@ -262,6 +474,9 @@
     state.smoothedLevel = 0;
     state.measuredDuration = 0;
     state.discardOnStop = false;
+    state.qualitySamples = [];
+    state.clippedSamples = 0;
+    state.qualityPeak = 0;
 
     startMeter(state.stream);
 
@@ -461,6 +676,9 @@
     state.chunks = [];
     state.levels = [];
     state.measuredDuration = 0;
+    state.qualitySamples = [];
+    state.clippedSamples = 0;
+    state.qualityPeak = 0;
 
     els.qrFrame.classList.remove('ready');
     els.qrImg.removeAttribute('src');
@@ -470,6 +688,7 @@
     els.baseInput.value = '';
 
     setView('idle');
+    updateIdentityGate();
   }
 
   function stopStream() {
@@ -533,9 +752,12 @@
     state.analyser.getByteTimeDomainData(data);
 
     let sum = 0;
+    let peak = 0;
     for (let i = 0; i < data.length; i += 1) {
       const value = (data[i] - 128) / 128;
       sum += value * value;
+      const absolute = Math.abs(value);
+      if (absolute > peak) peak = absolute;
     }
     const rms = Math.sqrt(sum / data.length);
     const level = Math.min(1, rms * 3.6);
@@ -544,6 +766,9 @@
     const now = performance.now();
     if (now - state.lastLevelAt >= 40) {
       state.levels.push(Math.max(0.015, state.smoothedLevel));
+      state.qualitySamples.push(rms);
+      state.qualityPeak = Math.max(state.qualityPeak, rms);
+      if (peak >= 0.985) state.clippedSamples += 1;
       state.lastLevelAt = now;
     }
 
@@ -637,6 +862,14 @@
   async function createQR() {
     if (!state.previewBlob || state.busy) return;
 
+    if (state.blocked) {
+      showError('An administrator has blocked this IP address.');
+      return;
+    }
+
+    const identity = ensureIdentity();
+    if (!identity) return;
+
     if (!config.uploadEnabled) {
       showError('This deployment is not connected to storage yet. Add a Vercel Blob store, then redeploy.');
       return;
@@ -654,9 +887,14 @@
     setButtonBusy(els.createBtn, true, 'Creating QR…');
 
     const payload = new FormData();
+    payload.append('studentName', identity.student.name);
+    payload.append('studentId', identity.student.id);
+    payload.append('grade', identity.student.grade);
     payload.append('title', els.titleInput.value.trim());
     payload.append('duration', String(Math.max(0, state.measuredDuration)));
     payload.append('peaks', JSON.stringify(buildPeaks(state.levels)));
+    const stats = qualityStats();
+    if (stats) payload.append('quality', JSON.stringify(stats));
     payload.append('autoplay', els.autoplayToggle.checked ? '1' : '0');
     payload.append('audio', state.previewBlob, `voice-note.${extensionForMime(state.previewBlob.type)}`);
 
@@ -675,6 +913,13 @@
       }
 
       if (!response.ok) {
+        if (data && data.blocked) {
+          enterBlockedState(data);
+          return;
+        }
+        if (data && Array.isArray(data.fields) && data.fields.length) {
+          throw new Error(data.fields.join(' '));
+        }
         throw new Error((data && data.error) || 'Could not create the QR code. Please try again.');
       }
 
@@ -683,7 +928,12 @@
       populateResult(data);
       setView('result');
       addToHistory(data);
-      toast('QR code ready. Scan it with your phone.', 'success');
+      toast(
+        data.underReview
+          ? 'Recording saved. An administrator will screen it before public playback.'
+          : 'QR code ready. Scan it with your phone.',
+        'success',
+      );
     } catch (error) {
       showError(error.message || 'Could not create the QR code. Please try again.');
     } finally {
@@ -699,6 +949,7 @@
     if (recording.duration) meta.push(formatClock(recording.duration));
     if (recording.size) meta.push(formatBytes(recording.size));
     if (recording.expiresAt) meta.push(`Expires ${formatDate(recording.expiresAt)}`);
+    if (recording.underReview) meta.push('Awaiting admin screening');
     els.resultMeta.textContent = meta.join(' · ');
 
     updateResultLinks();
@@ -769,11 +1020,17 @@
 
       if (!response.ok && response.status !== 404) {
         let message = 'Could not delete the recording.';
+        let blocked = null;
         try {
           const data = await response.json();
           if (data && data.error) message = data.error;
+          if (data && data.blocked) blocked = data;
         } catch {
           // Keep the generic message.
+        }
+        if (blocked) {
+          enterBlockedState(blocked);
+          return;
         }
         throw new Error(message);
       }
