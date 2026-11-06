@@ -558,7 +558,7 @@ async function writeStateDocument(name, value) {
       contentType: 'application/json',
       addRandomSuffix: false,
       allowOverwrite: true,
-      cacheControlMaxAge: 0,
+      cacheControlMaxAge: 60,
       token: BLOB_TOKEN,
     });
   } else {
@@ -1043,7 +1043,7 @@ async function writeMeta(meta) {
       contentType: 'application/json',
       addRandomSuffix: false,
       allowOverwrite: true,
-      cacheControlMaxAge: 0,
+      cacheControlMaxAge: 60,
       token: BLOB_TOKEN,
     });
     return;
