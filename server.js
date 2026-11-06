@@ -886,14 +886,12 @@ function isBlobMissing(err) {
   return err instanceof BlobNotFoundError || (err && (err.name === 'BlobNotFoundError' || err.statusCode === 404));
 }
 
-// Vercel Blob overwrites can serve the previous version from the CDN for up
-// to a minute. Mutable metadata and state must be read with cache=0 so that
-// moderation, blocks, and administrator changes take effect immediately.
+// Versioned reads avoid serving an older CDN copy after a Blob is overwritten.
+// Do not use cache=0 here: public Blob URLs reject it with a 400 response.
 function blobReadUrl(url, version) {
   try {
     const parsed = new URL(String(url));
     const stamp = version instanceof Date ? version.getTime() : (version || Date.now());
-    parsed.searchParams.set('cache', '0');
     parsed.searchParams.set('v', String(stamp));
     return parsed.toString();
   } catch {
