@@ -20,7 +20,7 @@ Then open **http://localhost:3000**.
 
 > On Windows PowerShell, `npm` may be blocked by the script execution policy. Use `npm.cmd install` or run `node server.js` after installing.
 
-Before the recorder unlocks, enter a full name, student ID, and grade level (`M.1`–`M.6` or `G.7`–`G.12`). The identity fields are validated on the client and again on the server; a recording without a valid identity is rejected. A warning above the name field explains that fake, impersonating, or inappropriate names can lead to a block.
+Before the recorder unlocks, enter a full name, number (เลขที่), and grade level (`M.1`–`M.6` or `G.7`–`G.12`) on a separate data-entry page. The recorder is then unlocked for that browser tab, just like moving past a sign-in screen. The identity fields are validated in the browser and again on the server; a recording without a valid identity is rejected. A warning above the name field explains that fake, impersonating, or inappropriate names can lead to a block. The header language menu switches the public pages between English and Thai.
 
 Click the mic, allow microphone access, record, stop, preview, add a title if you like, and create the QR code. The result screen lets you download the QR as a PNG, copy the link, open the player, or delete the recording.
 
@@ -203,8 +203,8 @@ Things to know before opening it to the public:
 ## How it works
 
 ```
-public/          Player and admin styles/scripts, recorder assets, favicon
-views/           Recorder page served through the server-side block gate
+public/          Player/admin styles/scripts, data-entry and recorder assets, language files
+views/           Data-entry and recording pages served through the server-side block gate
 server.js        Express app: upload, storage, QR PNG, play page, audio delivery, admin auth
 api/index.js     Vercel serverless entrypoint
 vercel.json      Vercel rewrites, function limits, daily cleanup cron
@@ -216,6 +216,7 @@ data/activity/   Encrypted activity log (auto-created, ignored by git)
 ```
 
 - Storage is behind a small adapter: local file mode, or Vercel Blob mode (`echotag/audio/...` and `echotag/meta/...`).
+- `/` is the data-entry screen and `/record` is the voice recorder. A valid identity is saved for the browser tab, so the recorder opens only after the data-entry step, like a sign-in screen. The header language menu switches the public pages between English and Thai.
 - Recording metadata and state documents are written as immutable, timestamped Blob versions. The newest version is discovered with `list`, so moderation, blocks, and admin changes take effect immediately instead of waiting for a CDN copy to expire.
 - The browser records with `MediaRecorder`, choosing Opus/WebM, AAC/MP4, or Ogg depending on the browser.
 - Uploads must include a valid student identity and are scored from the browser's audio-level samples before storage. A server-side moderation record controls whether the public player and media routes expose the note.

@@ -18,11 +18,9 @@
     errorText: $('errorText'),
     blockedBanner: $('blockedBanner'),
     blockedReason: $('blockedReason'),
-    studentNameInput: $('studentNameInput'),
-    studentIdInput: $('studentIdInput'),
-    gradeInput: $('gradeInput'),
-    identityState: $('identityState'),
-    identityHint: $('identityHint'),
+    identitySummary: $('identitySummary'),
+    identityName: $('identityName'),
+    identityMeta: $('identityMeta'),
     recordLock: $('recordLock'),
     views: {
       idle: $('view-idle'),
@@ -104,6 +102,7 @@
   let presenceBusy = false;
   let canvasCssWidth = 0;
   let canvasCssHeight = 0;
+  let studentIdentity = null;
 
   const ICON_WAVE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>';
   const ICON_ARROW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
@@ -118,11 +117,11 @@
 
     if (!window.isSecureContext) els.secureNote.hidden = false;
 
-    for (const field of [els.studentNameInput, els.studentIdInput, els.gradeInput]) {
-      field.addEventListener('input', updateIdentityGate);
-      field.addEventListener('change', updateIdentityGate);
-      field.addEventListener('blur', updateIdentityGate);
-    }
+    document.addEventListener('echotag:language', () => {
+      applyConfigToUi();
+      setView(state.view);
+      renderIdentitySummary();
+    });
 
     els.recordBtn.addEventListener('click', startRecording);
     els.stopBtn.addEventListener('click', stopRecording);
@@ -167,7 +166,8 @@
     });
 
     renderHistory();
-    updateIdentityGate();
+    applyConfigToUi();
+    if (!loadIdentityGate()) return;
     startPresence();
     loadConfig();
   }
@@ -191,7 +191,7 @@
         config.grades = data.grades.map((grade) => String(grade).toUpperCase());
       }
       applyConfigToUi();
-      updateIdentityGate();
+      loadIdentityGate();
     } catch {
       // Offline config fetch is non-fatal; the defaults still work.
     }
@@ -204,8 +204,8 @@
     });
 
     els.retentionNote.textContent = config.retentionDays > 0
-      ? `Notes are kept for ${config.retentionDays} days, then automatically deleted.`
-      : 'Notes are kept until you delete them.';
+      ? EchoTagI18n.t('footer.retentionDays', { days: config.retentionDays })
+      : EchoTagI18n.t('footer.retentionForever');
 
     if (!config.uploadEnabled) {
       showError('This deployment is not connected to storage yet. Add a Vercel Blob store, then redeploy.');
@@ -216,88 +216,43 @@
   /* Student identity gate + presence                                   */
   /* ------------------------------------------------------------------ */
 
-  function readIdentity() {
-    const name = els.studentNameInput.value
-      .replace(/[\u0000-\u001f\u007f]/g, ' ')
-      .replace(/[<>]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 80);
-    const id = els.studentIdInput.value
-      .trim()
-      .replace(/\s+/g, '')
-      .toUpperCase()
-      .slice(0, 30);
-    const grade = els.gradeInput.value.trim().toUpperCase();
-    const errors = [];
-
-    if (name.length < 2) {
-      errors.push('Enter your full name.');
-    } else if (!/\p{L}/u.test(name)) {
-      errors.push('Your name must contain letters.');
-    } else if (!/^[\p{L}\p{M} .'’\-]+$/u.test(name)) {
-      errors.push('Use letters, spaces, hyphens, apostrophes, or periods in your name.');
-    }
-
-    if (!/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(id)) {
-      errors.push('Enter your student ID (3–30 letters, numbers, dots, dashes, or slashes).');
-    }
-
-    if (!config.grades.includes(grade)) {
-      errors.push('Select your grade level.');
-    }
-
-    return {
-      ok: errors.length === 0,
-      errors,
-      student: { name, id, grade },
-    };
+  function readStoredIdentity() {
+    const stored = EchoTagIdentity.load();
+    return EchoTagIdentity.validate(stored || {}, config.grades);
   }
 
-  function updateIdentityGate() {
-    const identity = readIdentity();
-    const hasAny = Boolean(
-      els.studentNameInput.value.trim()
-      || els.studentIdInput.value.trim()
-      || els.gradeInput.value,
-    );
-
-    if (identity.ok) {
-      els.identityState.textContent = 'Ready';
-      els.identityState.dataset.state = 'ready';
-      els.identityHint.textContent = 'Identity complete. Recording is unlocked.';
-      els.recordLock.textContent = 'Recording unlocked for this student identity.';
-    } else {
-      els.identityState.textContent = hasAny ? 'Incomplete' : 'Required';
-      els.identityState.dataset.state = hasAny ? 'incomplete' : 'required';
-      els.identityHint.textContent = hasAny
-        ? identity.errors[0]
-        : 'Enter your full name, student ID, and grade to unlock recording.';
-      els.recordLock.textContent = 'Enter your student details above to unlock recording.';
+  function loadIdentityGate() {
+    const identity = readStoredIdentity();
+    if (!identity.ok) {
+      studentIdentity = null;
+      els.recordBtn.disabled = true;
+      window.location.replace('/');
+      return null;
     }
 
-    els.recordLock.classList.toggle('is-ready', identity.ok);
-    els.recordBtn.disabled = !identity.ok || state.blocked;
+    studentIdentity = identity.student;
+    renderIdentitySummary();
+    els.recordLock.textContent = EchoTagI18n.t('recorder.identityUnlocked');
+    els.recordLock.classList.add('is-ready');
+    els.recordBtn.disabled = state.blocked;
     return identity;
   }
 
-  function focusFirstIdentityField() {
-    const fallback = els.studentNameInput;
-    const target = els.studentNameInput.value.trim().length < 2
-      ? els.studentNameInput
-      : !/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(els.studentIdInput.value.trim().replace(/\s+/g, '').toUpperCase())
-        ? els.studentIdInput
-        : !config.grades.includes(els.gradeInput.value.trim().toUpperCase())
-          ? els.gradeInput
-          : fallback;
-    if (target && typeof target.focus === 'function') target.focus();
+  function renderIdentitySummary() {
+    if (!studentIdentity) return;
+    els.identitySummary.hidden = false;
+    els.identityName.textContent = studentIdentity.name;
+    els.identityMeta.textContent = `${studentIdentity.id} · ${studentIdentity.grade}`;
   }
 
   function ensureIdentity() {
-    const identity = updateIdentityGate();
-    if (identity.ok) return identity;
-    showError(identity.errors[0]);
-    focusFirstIdentityField();
+    const identity = EchoTagIdentity.validate(studentIdentity || {}, config.grades);
+    if (identity.ok) {
+      studentIdentity = identity.student;
+      return identity;
+    }
+    showError('Enter your student details before recording.');
+    window.location.replace('/');
     return null;
   }
 
@@ -352,12 +307,12 @@
     document.body.classList.add('is-blocked');
 
     if (data && data.reason) {
-      els.blockedReason.textContent = `An administrator blocked this IP address. Reason: ${data.reason}`;
+      els.blockedReason.textContent = EchoTagI18n.t('blocked.apiReason', { reason: data.reason });
     } else {
-      els.blockedReason.textContent = 'An administrator blocked this IP address. Contact the administrator if you believe this is a mistake.';
+      els.blockedReason.textContent = EchoTagI18n.t('blocked.defaultReason');
     }
     els.blockedBanner.hidden = false;
-    if (data && data.reason) toast(`Blocked by an administrator: ${data.reason}`, 'error');
+    if (data && data.reason) toast(EchoTagI18n.t('blocked.apiReason', { reason: data.reason }), 'error');
   }
 
   function qualityStats() {
@@ -387,12 +342,13 @@
 
     state.view = next;
     els.statusBadge.dataset.state = next;
-    els.statusText.textContent = {
-      idle: 'Ready',
-      recording: 'Recording',
-      preview: 'Preview',
-      result: 'Ready to scan',
-    }[next] || 'Ready';
+    const statusKeys = {
+      idle: 'recorder.statusReady',
+      recording: 'recorder.statusRecording',
+      preview: 'recorder.statusPreview',
+      result: 'recorder.statusResult',
+    };
+    els.statusText.textContent = EchoTagI18n.t(statusKeys[next] || 'recorder.statusReady');
     clearError();
   }
 
@@ -688,7 +644,7 @@
     els.baseInput.value = '';
 
     setView('idle');
-    updateIdentityGate();
+    loadIdentityGate();
   }
 
   function stopStream() {

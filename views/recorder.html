@@ -11,9 +11,11 @@
   <meta property="og:type" content="website">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
+  <script src="/i18n.js" defer></script>
+  <script src="/identity.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
-<body>
+<body data-page="recorder">
   <div class="page-glow" aria-hidden="true"></div>
   <div class="page-grid" aria-hidden="true"></div>
 
@@ -25,10 +27,10 @@
           <path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v3"/>
         </svg>
       </span>
-      <p class="eyebrow">Access blocked</p>
-      <h2>An administrator blocked this connection.</h2>
-      <p id="blockedReason">This IP address cannot use EchoTag right now.</p>
-      <p class="blocked-help">If you believe this is a mistake, contact the administrator of this EchoTag site.</p>
+      <p class="eyebrow" data-i18n="blocked.eyebrow">Access blocked</p>
+      <h2 data-i18n="blocked.title">An administrator blocked this connection.</h2>
+      <p id="blockedReason" data-i18n="blocked.defaultReason">This IP address cannot use EchoTag right now.</p>
+      <p class="blocked-help" data-i18n="blocked.help">If you believe this is a mistake, contact the administrator of this EchoTag site.</p>
     </div>
   </div>
 
@@ -41,79 +43,56 @@
       </span>
       <span class="brand-name">Echo<span>Tag</span></span>
     </a>
-    <p class="header-tagline">Voice notes, one scan away</p>
+    <div class="header-tools">
+      <nav class="site-nav" aria-label="Primary">
+        <a href="/" data-i18n="nav.details">Data entry</a>
+        <a href="/record" aria-current="page" data-i18n="nav.record">Voice recording</a>
+      </nav>
+      <label class="language-menu">
+        <span class="sr-only" data-i18n="nav.language">Language</span>
+        <select data-language-select aria-label="Language">
+          <option value="en">EN · English</option>
+          <option value="th">TH · ไทย</option>
+        </select>
+      </label>
+    </div>
   </header>
 
   <main class="page">
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow"><span class="pulse-dot" aria-hidden="true"></span> No app. No account. Just a voice.</p>
-        <h1>Send a voice.<br><span class="gradient-text">Leave a QR.</span></h1>
-        <p class="lede">Record a message, turn it into a scannable code, and let anyone hear it straight from their phone camera — right in the browser.</p>
+        <p class="eyebrow"><span class="pulse-dot" aria-hidden="true"></span> <span data-i18n="recorder.eyebrow">No app. No account. Just a voice.</span></p>
+        <h1 data-i18n="recorder.title">Send a voice.<br><span class="gradient-text">Leave a QR.</span></h1>
+        <p class="lede" data-i18n="recorder.lede">Record a message, turn it into a scannable code, and let anyone hear it straight from their phone camera — right in the browser.</p>
 
         <ul class="points">
-          <li><span class="point-icon" aria-hidden="true"></span> Works on any phone, no app to install</li>
-          <li><span class="point-icon" aria-hidden="true"></span> Plays automatically when the browser allows it</li>
-          <li><span class="point-icon" aria-hidden="true"></span> Unlisted link, created fresh for every note</li>
+          <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="recorder.point1">Works on any phone, no app to install</span></li>
+          <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="recorder.point2">Plays automatically when the browser allows it</span></li>
+          <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="recorder.point3">Unlisted link, created fresh for every note</span></li>
         </ul>
 
         <aside class="lan-tip" id="lanTip">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
             <path d="M5 12.5a10 10 0 0 1 14 0M8 15.5a5.5 5.5 0 0 1 8 0M12 19h.01"/>
           </svg>
-          <p><strong>Testing on this computer?</strong> Keep your phone on the same Wi-Fi. Your QR will point to your computer's network address automatically.</p>
+          <p data-i18n="recorder.lanTip"><strong>Testing on this computer?</strong> Keep your phone on the same Wi-Fi. Your QR will point to your computer's network address automatically.</p>
         </aside>
       </div>
 
       <div class="recorder-stack">
-        <section class="identity-card" aria-labelledby="identityHeading">
-          <div class="identity-head">
-            <p class="section-kicker">Student identity</p>
-            <span class="identity-state" id="identityState" data-state="required">Required</span>
-          </div>
-
-          <div class="identity-warning" role="note">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 3 3.7 18a2 2 0 0 0 1.75 3h13.1a2 2 0 0 0 1.75-3L12 3Z"/>
-              <path d="M12 9v5M12 17h.01"/>
+        <div class="identity-summary" id="identitySummary" hidden>
+          <span class="identity-summary-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>
             </svg>
-            <p><strong>Use your real name and school details.</strong> Fake, impersonating, or inappropriate names may be blocked from EchoTag and reported to your school.</p>
-          </div>
-
-          <h2 class="identity-title" id="identityHeading">Who is recording?</h2>
-          <p class="identity-sub">The administrator can see this information with your recording.</p>
-
-          <div class="identity-fields">
-            <label class="field">
-              <span class="field-label">Full name</span>
-              <input id="studentNameInput" type="text" maxlength="80" placeholder="First and last name" autocomplete="name" spellcheck="false" required>
-            </label>
-            <label class="field">
-              <span class="field-label">Student ID</span>
-              <input id="studentIdInput" type="text" maxlength="30" placeholder="e.g. 12345" autocomplete="off" spellcheck="false" required>
-            </label>
-            <label class="field field-grade">
-              <span class="field-label">Grade level</span>
-              <select id="gradeInput" required>
-                <option value="">Select grade</option>
-                <option value="M.1">M.1</option>
-                <option value="M.2">M.2</option>
-                <option value="M.3">M.3</option>
-                <option value="M.4">M.4</option>
-                <option value="M.5">M.5</option>
-                <option value="M.6">M.6</option>
-                <option value="G.7">G.7</option>
-                <option value="G.8">G.8</option>
-                <option value="G.9">G.9</option>
-                <option value="G.10">G.10</option>
-                <option value="G.11">G.11</option>
-                <option value="G.12">G.12</option>
-              </select>
-            </label>
-          </div>
-
-          <p class="identity-hint" id="identityHint">Enter your full name, student ID, and grade to unlock recording.</p>
-        </section>
+          </span>
+          <span class="identity-summary-copy">
+            <span class="identity-summary-label" data-i18n="recorder.recordingAs">Recording as</span>
+            <strong id="identityName"></strong>
+            <span class="identity-summary-meta" id="identityMeta"></span>
+          </span>
+          <a class="identity-change" href="/" data-i18n="recorder.changeDetails">Change details</a>
+        </div>
 
         <div class="recorder-card" aria-labelledby="recorderHeading">
         <h2 class="sr-only" id="recorderHeading">Voice note recorder</h2>
@@ -121,9 +100,9 @@
         <div class="card-top">
           <span class="status-badge" id="statusBadge" data-state="idle" aria-live="polite">
             <span class="status-dot" aria-hidden="true"></span>
-            <span id="statusText">Ready</span>
+            <span id="statusText" data-i18n="recorder.statusReady">Ready</span>
           </span>
-          <span class="card-limit">Up to <span data-max-minutes>5</span> min</span>
+          <span class="card-limit"><span data-i18n="recorder.upTo">Up to</span> <span data-max-minutes>5</span> <span data-i18n="recorder.min">min</span></span>
         </div>
 
         <div class="error-banner" id="errorBanner" role="alert" hidden>
@@ -143,15 +122,15 @@
               </svg>
             </button>
           </div>
-          <h3 class="view-title">Tap to record</h3>
-          <p class="view-sub">Speak naturally. You can preview it before sharing.</p>
-          <p class="record-lock" id="recordLock">Enter your student details above to unlock recording.</p>
-          <p class="secure-note" id="secureNote" hidden>Recording needs a secure page. Open this site via <strong>localhost</strong> or <strong>HTTPS</strong> to use your microphone.</p>
+          <h3 class="view-title" data-i18n="recorder.tapToRecord">Tap to record</h3>
+          <p class="view-sub" data-i18n="recorder.speakNaturally">Speak naturally. You can preview it before sharing.</p>
+          <p class="record-lock" id="recordLock" data-i18n="recorder.identityUnlocked">Identity verified. Recording is unlocked.</p>
+          <p class="secure-note" id="secureNote" hidden data-i18n="recorder.secureNote">Recording needs a secure page. Open this site via <strong>localhost</strong> or <strong>HTTPS</strong> to use your microphone.</p>
         </div>
 
         <div class="view" id="view-recording" hidden>
           <div class="recording-head">
-            <span class="live-pill"><span aria-hidden="true"></span> Live</span>
+            <span class="live-pill"><span aria-hidden="true"></span> <span data-i18n="recorder.live">Live</span></span>
             <span class="timer" id="timer">0:00</span>
           </div>
           <div class="viz-wrap">
@@ -159,53 +138,53 @@
           </div>
           <div class="view-actions">
             <button class="btn btn-primary btn-stop" id="stopBtn" type="button">
-              <span class="stop-square" aria-hidden="true"></span> Stop &amp; preview
+              <span class="stop-square" aria-hidden="true"></span> <span data-i18n="recorder.stopPreview">Stop &amp; preview</span>
             </button>
-            <button class="link-button" id="cancelBtn" type="button">Cancel recording</button>
+            <button class="link-button" id="cancelBtn" type="button" data-i18n="recorder.cancelRecording">Cancel recording</button>
           </div>
         </div>
 
         <div class="view" id="view-preview" hidden>
           <div class="preview-head">
-            <p class="section-kicker">Preview</p>
+            <p class="section-kicker" data-i18n="recorder.preview">Preview</p>
             <span class="preview-duration" id="previewDuration"></span>
           </div>
           <div class="audio-wrap">
             <audio id="previewAudio" controls preload="metadata"></audio>
           </div>
           <label class="field">
-            <span class="field-label">Title <em>optional</em></span>
-            <input id="titleInput" type="text" maxlength="80" placeholder="A little hello" autocomplete="off">
+            <span class="field-label" data-i18n="recorder.titleOptional">Title <em>optional</em></span>
+            <input id="titleInput" type="text" maxlength="80" placeholder="A little hello" data-i18n-placeholder="recorder.titlePlaceholder" autocomplete="off">
           </label>
           <label class="switch-row">
             <span class="switch-text">
-              <strong>Play automatically when scanned</strong>
-              <small>Some browsers still need a tap first.</small>
+              <strong data-i18n="recorder.autoplayTitle">Play automatically when scanned</strong>
+              <small data-i18n="recorder.autoplayHint">Some browsers still need a tap first.</small>
             </span>
             <input id="autoplayToggle" type="checkbox" checked>
             <span class="switch-track" aria-hidden="true"></span>
           </label>
           <div class="view-actions">
-            <button class="btn btn-primary" id="createBtn" type="button">Create QR code</button>
-            <button class="link-button" id="retakeBtn" type="button">Record again</button>
+            <button class="btn btn-primary" id="createBtn" type="button" data-i18n="recorder.createQR">Create QR code</button>
+            <button class="link-button" id="retakeBtn" type="button" data-i18n="recorder.recordAgain">Record again</button>
           </div>
         </div>
 
         <div class="view" id="view-result" hidden>
           <div class="result-head">
-            <p class="section-kicker">Scan to listen</p>
-            <h3 class="result-title" id="resultTitle">Voice note</h3>
+            <p class="section-kicker" data-i18n="recorder.scanToListen">Scan to listen</p>
+            <h3 class="result-title" id="resultTitle" data-i18n="recorder.voiceNote">Voice note</h3>
             <p class="result-meta" id="resultMeta"></p>
           </div>
 
           <div class="qr-frame" id="qrFrame">
             <div class="qr-spinner" aria-hidden="true"></div>
-            <img id="qrImg" alt="QR code that opens this voice note">
+            <img id="qrImg" alt="QR code that opens this voice note" data-i18n-aria-label="recorder.qrAlt">
           </div>
 
           <div class="link-row">
             <a class="play-link" id="playLink" target="_blank" rel="noopener"></a>
-            <button class="icon-button" id="copyBtn" type="button" aria-label="Copy link">
+            <button class="icon-button" id="copyBtn" type="button" aria-label="Copy link" data-i18n-aria-label="recorder.copyLink">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0 0 12.5 4h-6A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 6.5 15H9"/>
               </svg>
@@ -213,22 +192,22 @@
           </div>
 
           <div class="view-actions result-actions">
-            <a class="btn btn-primary" id="downloadBtn">Download QR</a>
-            <a class="btn btn-ghost" id="openBtn" target="_blank" rel="noopener">Open player</a>
+            <a class="btn btn-primary" id="downloadBtn" data-i18n="recorder.downloadQR">Download QR</a>
+            <a class="btn btn-ghost" id="openBtn" target="_blank" rel="noopener" data-i18n="recorder.openPlayer">Open player</a>
           </div>
 
           <details class="settings">
-            <summary>QR link settings</summary>
-            <p>Use an address your phone can reach — your computer's network URL for a same-Wi-Fi test, or your public domain once deployed.</p>
+            <summary data-i18n="recorder.settingsSummary">QR link settings</summary>
+            <p data-i18n="recorder.settingsBody">Use an address your phone can reach — your computer's network URL for a same-Wi-Fi test, or your public domain once deployed.</p>
             <div class="base-row">
-              <input id="baseInput" type="text" inputmode="url" spellcheck="false" aria-label="Base address used in the QR code">
-              <button class="btn btn-small" id="applyBaseBtn" type="button">Apply</button>
+              <input id="baseInput" type="text" inputmode="url" spellcheck="false" aria-label="Base address used in the QR code" data-i18n-aria-label="recorder.baseAddress">
+              <button class="btn btn-small" id="applyBaseBtn" type="button" data-i18n="recorder.apply">Apply</button>
             </div>
           </details>
 
           <div class="result-foot">
-            <button class="link-button" id="newBtn" type="button">Record another</button>
-            <button class="link-button danger" id="deleteBtn" type="button">Delete note</button>
+            <button class="link-button" id="newBtn" type="button" data-i18n="recorder.recordAnother">Record another</button>
+            <button class="link-button danger" id="deleteBtn" type="button" data-i18n="recorder.deleteNote">Delete note</button>
           </div>
         </div>
       </div>
@@ -237,40 +216,40 @@
 
     <section class="recent-section" id="recentSection" hidden>
       <div class="section-head">
-        <h2>Recent notes</h2>
-        <span>Saved in this browser</span>
+        <h2 data-i18n="recorder.recentNotes">Recent notes</h2>
+        <span data-i18n="recorder.savedInBrowser">Saved in this browser</span>
       </div>
       <div class="recent-grid" id="recentList"></div>
     </section>
 
     <section class="how">
       <div class="section-head">
-        <h2>Three taps, one voice note</h2>
-        <span>That is the whole flow</span>
+        <h2 data-i18n="recorder.howTitle">Three taps, one voice note</h2>
+        <span data-i18n="recorder.howSub">That is the whole flow</span>
       </div>
       <div class="steps">
         <article class="step">
           <span class="step-num">01</span>
-          <h3>Record</h3>
-          <p>Hit the mic and say what a text message cannot. Keep it short or take your time.</p>
+          <h3 data-i18n="recorder.howStep1Title">Record</h3>
+          <p data-i18n="recorder.howStep1Text">Hit the mic and say what a text message cannot. Keep it short or take your time.</p>
         </article>
         <article class="step">
           <span class="step-num">02</span>
-          <h3>Share</h3>
-          <p>Your note becomes a clean QR code and a link. Download the code or show it on your screen.</p>
+          <h3 data-i18n="recorder.howStep2Title">Share</h3>
+          <p data-i18n="recorder.howStep2Text">Your note becomes a clean QR code and a link. Download the code or show it on your screen.</p>
         </article>
         <article class="step">
           <span class="step-num">03</span>
-          <h3>Scan</h3>
-          <p>A camera scan opens the player. Audio starts on its own when the browser allows it — otherwise, one tap.</p>
+          <h3 data-i18n="recorder.howStep3Title">Scan</h3>
+          <p data-i18n="recorder.howStep3Text">A camera scan opens the player. Audio starts on its own when the browser allows it — otherwise, one tap.</p>
         </article>
       </div>
     </section>
   </main>
 
   <footer class="site-footer">
-    <p><span class="footer-brand">EchoTag</span> · Audio lives on this server, not inside the QR code.</p>
-    <p id="retentionNote">Notes are kept for 30 days.</p>
+    <p><span class="footer-brand">EchoTag</span> · <span data-i18n="recorder.footerLine">Audio lives on this server, not inside the QR code.</span></p>
+    <p id="retentionNote"></p>
     <p class="copyright">© Sinsana Studio 2026 · All rights reserved.</p>
   </footer>
 

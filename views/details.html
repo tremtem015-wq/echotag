@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>EchoTag — Student details</title>
+  <meta name="description" content="Enter your student details before recording a voice note with EchoTag.">
+  <meta name="theme-color" content="#08080d">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/i18n.js" defer></script>
+  <script src="/identity.js" defer></script>
+  <script src="/details.js" defer></script>
+</head>
+<body data-page="details">
+  <div class="page-glow" aria-hidden="true"></div>
+  <div class="page-grid" aria-hidden="true"></div>
+
+  <div class="blocked-overlay" id="blockedBanner" role="alert" aria-live="assertive" hidden>
+    <div class="blocked-card">
+      <span class="blocked-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10" width="15" height="10.5" rx="2.5"/>
+          <path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v3"/>
+        </svg>
+      </span>
+      <p class="eyebrow" data-i18n="blocked.eyebrow">Access blocked</p>
+      <h2 data-i18n="blocked.title">An administrator blocked this connection.</h2>
+      <p id="blockedReason" data-i18n="blocked.defaultReason">This IP address cannot use EchoTag right now.</p>
+      <p class="blocked-help" data-i18n="blocked.help">If you believe this is a mistake, contact the administrator of this EchoTag site.</p>
+    </div>
+  </div>
+
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="EchoTag home">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/>
+        </svg>
+      </span>
+      <span class="brand-name">Echo<span>Tag</span></span>
+    </a>
+    <div class="header-tools">
+      <nav class="site-nav" aria-label="Primary">
+        <a href="/" aria-current="page" data-i18n="nav.details">Data entry</a>
+        <a href="/record" data-i18n="nav.record">Voice recording</a>
+      </nav>
+      <label class="language-menu">
+        <span class="sr-only" data-i18n="nav.language">Language</span>
+        <select data-language-select aria-label="Language">
+          <option value="en">EN · English</option>
+          <option value="th">TH · ไทย</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main class="page entry-page">
+    <section class="entry-intro">
+      <p class="eyebrow"><span class="pulse-dot" aria-hidden="true"></span> <span data-i18n="details.eyebrow">Student details · Step 1 of 2</span></p>
+      <h1 data-i18n="details.title">Tell us who<br><span class="gradient-text">is recording.</span></h1>
+      <p class="lede" data-i18n="details.lede">Enter your school details once. After that, you will move to a separate voice recording page — just like signing in before you start.</p>
+      <ul class="points">
+        <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point1">Your name, number, and grade stay attached to every note you record</span></li>
+        <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point2">The administrator can review this information with the audio</span></li>
+        <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point3">Your details stay in this browser tab only</span></li>
+      </ul>
+    </section>
+
+    <section class="identity-card entry-card" aria-labelledby="identityHeading">
+      <div class="identity-head">
+        <p class="section-kicker" data-i18n="details.step">Step 1 of 2</p>
+        <span class="identity-state" id="identityState" data-state="required" data-i18n="details.stateRequired">Required</span>
+      </div>
+
+      <div class="identity-warning" role="note">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3 3.7 18a2 2 0 0 0 1.75 3h13.1a2 2 0 0 0 1.75-3L12 3Z"/>
+          <path d="M12 9v5M12 17h.01"/>
+        </svg>
+        <p data-i18n="details.warning"><strong>Use your real name and school details.</strong> Fake, impersonating, or inappropriate names may be blocked from EchoTag and reported to your school.</p>
+      </div>
+
+      <h2 class="identity-title" id="identityHeading" data-i18n="details.heading">Who is recording?</h2>
+      <p class="identity-sub" data-i18n="details.sub">The administrator can see this information with your recording.</p>
+
+      <form id="identityForm" novalidate>
+        <div class="identity-fields">
+          <label class="field">
+            <span class="field-label" data-i18n="details.fullName">Full name</span>
+            <input id="studentNameInput" name="studentName" type="text" maxlength="80" placeholder="First and last name" data-i18n-placeholder="details.fullNamePlaceholder" autocomplete="name" spellcheck="false" required>
+          </label>
+          <label class="field">
+            <span class="field-label" data-i18n="details.number">Number (เลขที่)</span>
+            <input id="studentIdInput" name="studentId" type="text" maxlength="30" placeholder="e.g. 12345" data-i18n-placeholder="details.numberPlaceholder" autocomplete="off" spellcheck="false" required>
+          </label>
+          <label class="field field-grade">
+            <span class="field-label" data-i18n="details.grade">Grade level</span>
+            <select id="gradeInput" name="grade" required>
+              <option value="" data-i18n="details.gradePlaceholder">Select grade</option>
+              <option value="M.1">M.1</option>
+              <option value="M.2">M.2</option>
+              <option value="M.3">M.3</option>
+              <option value="M.4">M.4</option>
+              <option value="M.5">M.5</option>
+              <option value="M.6">M.6</option>
+              <option value="G.7">G.7</option>
+              <option value="G.8">G.8</option>
+              <option value="G.9">G.9</option>
+              <option value="G.10">G.10</option>
+              <option value="G.11">G.11</option>
+              <option value="G.12">G.12</option>
+            </select>
+          </label>
+        </div>
+
+        <p class="identity-hint" id="identityHint" data-i18n="details.hint">Enter your full name, number, and grade to continue.</p>
+        <button class="btn btn-primary entry-submit" id="continueBtn" type="submit" disabled data-i18n="details.continue">Continue to voice recording</button>
+      </form>
+
+      <p class="entry-note" data-i18n="details.note">After you continue, the recorder opens on its own page. Use “Change details” there if you need to come back.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p><span class="footer-brand">EchoTag</span> · <span data-i18n="footer.line">Audio lives on this server, not inside the QR code.</span></p>
+    <p id="retentionNote"></p>
+    <p class="copyright">© Sinsana Studio 2026 · All rights reserved.</p>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

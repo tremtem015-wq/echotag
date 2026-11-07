@@ -283,8 +283,8 @@ function cleanStudentId(raw) {
     .toUpperCase()
     .slice(0, 30);
 
-  if (!/^[A-Z0-9][A-Z0-9._/-]{2,29}$/.test(value)) {
-    return { error: 'Enter a student ID with 3–30 letters, numbers, dots, dashes, or slashes.' };
+  if (!/^(?=.*\d)[A-Z0-9][A-Z0-9._/-]{0,29}$/.test(value)) {
+    return { error: 'Enter a number with 1–30 characters, including at least one digit.' };
   }
   return { value };
 }
@@ -2626,7 +2626,11 @@ app.use('/admin', (req, res) => {
   ));
 });
 
-app.get(['/', '/index.html'], publicPageBlockGate, (req, res) => {
+app.get(['/', '/index.html', '/details'], publicPageBlockGate, (req, res) => {
+  res.sendFile(path.join(VIEWS_DIR, 'details.html'));
+});
+
+app.get('/record', publicPageBlockGate, (req, res) => {
   res.sendFile(path.join(VIEWS_DIR, 'recorder.html'));
 });
 
@@ -3303,7 +3307,7 @@ function renderAdminScreeningPage({ recordings, csrf, filter, query, status, lis
         <form class="search" method="get" action="/admin/screening" role="search">
           <input type="hidden" name="filter" value="${escapeHtml(filter)}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          <input type="search" name="q" value="${escapeHtml(query)}" placeholder="Search name, ID, title, or code" autocomplete="off">
+          <input type="search" name="q" value="${escapeHtml(query)}" placeholder="Search name, number, title, or code" autocomplete="off">
         </form>
       </div>
       <div class="filter-row">${filterLinks}</div>
@@ -3756,7 +3760,7 @@ function renderAdminDashboard({ recordings, csrf, status, listError, storageLabe
         <label class="search">
           <span class="sr-only">Search recordings</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          <input id="adminSearch" type="search" placeholder="Search name, ID, title, or code" autocomplete="off">
+          <input id="adminSearch" type="search" placeholder="Search name, number, title, or code" autocomplete="off">
         </label>
       </div>
 
