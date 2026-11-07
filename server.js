@@ -730,7 +730,9 @@ async function readBlocks({ force = false } = {}) {
 async function findBlockForIp(ip) {
   const normalized = normalizeIp(ip);
   if (!normalized) return null;
-  const blocks = await readBlocks();
+  // Public gates must never consult a per-instance cache: an administrator's
+  // block or unblock has to apply on the very next request, on every instance.
+  const blocks = await readBlocks({ force: true });
   return blocks.find((block) => normalizeIp(block.ip) === normalized) || null;
 }
 
