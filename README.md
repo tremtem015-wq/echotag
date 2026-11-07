@@ -215,6 +215,7 @@ data/activity/   Encrypted activity log (auto-created, ignored by git)
 ```
 
 - Storage is behind a small adapter: local file mode, or Vercel Blob mode (`echotag/audio/...` and `echotag/meta/...`).
+- Recording metadata and state documents are written as immutable, timestamped Blob versions. The newest version is discovered with `list`, so moderation, blocks, and admin changes take effect immediately instead of waiting for a CDN copy to expire.
 - The browser records with `MediaRecorder`, choosing Opus/WebM, AAC/MP4, or Ogg depending on the browser.
 - Uploads must include a valid student identity and are scored from the browser's audio-level samples before storage. A server-side moderation record controls whether the public player and media routes expose the note.
 - The recorder and player send a lightweight presence heartbeat so the console can list active IP addresses. Blocks are checked on public page, API, QR, and media routes.

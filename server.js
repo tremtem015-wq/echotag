@@ -520,6 +520,29 @@ function decodeStoredDocument(raw, fallback) {
 
 const stateCache = new Map();
 
+// Public Blob URLs can keep serving the previous bytes after an overwrite, so
+// every metadata/state write gets a unique immutable pathname instead.
+function blobVersionSuffix() {
+  return `${String(Date.now()).padStart(13, '0')}-${crypto.randomBytes(6).toString('hex')}`;
+}
+
+async function listAllBlobs(prefix) {
+  const blobs = [];
+  let cursor;
+  do {
+    const page = await list({ prefix, cursor, limit: 1000, token: BLOB_TOKEN });
+    blobs.push(...page.blobs);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+  return blobs;
+}
+
+function newestBlobFirst(a, b) {
+  const delta = (new Date(b.uploadedAt).getTime() || 0) - (new Date(a.uploadedAt).getTime() || 0);
+  if (delta !== 0) return delta;
+  return String(b.pathname).localeCompare(String(a.pathname));
+}
+
 async function readStateDocument(name, fallback, { force = false } = {}) {
   const cached = stateCache.get(name);
   if (!force && cached && Date.now() - cached.at < STATE_CACHE_TTL_MS) {
@@ -529,9 +552,13 @@ async function readStateDocument(name, fallback, { force = false } = {}) {
   let raw = null;
   if (STORAGE_MODE === 'blob') {
     try {
-      const info = await head(`${BLOB_STATE_PREFIX}${name}.json`, { token: BLOB_TOKEN });
-      const response = await fetch(blobReadUrl(info.url, info.uploadedAt), { cache: 'no-store' });
-      if (response.ok) raw = await response.text();
+      const versions = (await listAllBlobs(`${BLOB_STATE_PREFIX}${name}.`)).sort(newestBlobFirst);
+      for (const blob of versions) {
+        const response = await fetch(blob.url, { cache: 'no-store' });
+        if (!response.ok) continue;
+        raw = await response.text();
+        break;
+      }
     } catch (err) {
       if (!isBlobMissing(err)) console.warn(`State read warning (${name}):`, err.message);
     }
@@ -548,19 +575,29 @@ async function readStateDocument(name, fallback, { force = false } = {}) {
   return value;
 }
 
+async function pruneStateVersions(name) {
+  try {
+    const versions = (await listAllBlobs(`${BLOB_STATE_PREFIX}${name}.`)).sort(newestBlobFirst);
+    const stale = versions.slice(8).map((blob) => blob.pathname);
+    if (stale.length) await del(stale, { token: BLOB_TOKEN });
+  } catch (err) {
+    if (!isBlobMissing(err)) console.warn(`State prune warning (${name}):`, err.message);
+  }
+}
+
 async function writeStateDocument(name, value) {
   if (STORAGE_MODE === 'unavailable') throw httpError(503, 'Storage is not connected.');
 
   const raw = encodeStoredDocument(value);
   if (STORAGE_MODE === 'blob') {
-    await put(`${BLOB_STATE_PREFIX}${name}.json`, raw, {
+    await put(`${BLOB_STATE_PREFIX}${name}.${blobVersionSuffix()}.json`, raw, {
       access: 'public',
       contentType: 'application/json',
       addRandomSuffix: false,
-      allowOverwrite: true,
       cacheControlMaxAge: 60,
       token: BLOB_TOKEN,
     });
+    await pruneStateVersions(name);
   } else {
     const target = path.join(STATE_DIR, `${name}.json`);
     const temp = `${target}.${process.pid}.tmp`;
@@ -874,8 +911,16 @@ function audioPathFor(meta) {
   return path.join(DATA_DIR, `${meta.code}${extensionFor(meta)}`);
 }
 
-function blobMetaPathname(code) {
-  return `${BLOB_META_PREFIX}${code}.json`;
+function blobMetaVersionPathname(code) {
+  return `${BLOB_META_PREFIX}${code}.${blobVersionSuffix()}.json`;
+}
+
+function metaCodeFromPathname(pathname) {
+  const value = String(pathname || '');
+  if (!value.startsWith(BLOB_META_PREFIX) || !value.endsWith('.json')) return null;
+  const stem = value.slice(BLOB_META_PREFIX.length, -'.json'.length);
+  const code = stem.split('.')[0];
+  return CODE_PATTERN.test(code) ? code : null;
 }
 
 function blobAudioPathname(meta) {
@@ -886,40 +931,44 @@ function isBlobMissing(err) {
   return err instanceof BlobNotFoundError || (err && (err.name === 'BlobNotFoundError' || err.statusCode === 404));
 }
 
-// Versioned reads avoid serving an older CDN copy after a Blob is overwritten.
-// Do not use cache=0 here: public Blob URLs reject it with a 400 response.
-function blobReadUrl(url, version) {
-  try {
-    const parsed = new URL(String(url));
-    const stamp = version instanceof Date ? version.getTime() : (version || Date.now());
-    parsed.searchParams.set('v', String(stamp));
-    return parsed.toString();
-  } catch {
-    return String(url);
-  }
-}
-
 function parseMeta(value, code) {
   if (!value || value.code !== code || !value.mime) return null;
   return value;
 }
 
+async function latestMetaBlobs() {
+  const latest = new Map();
+  for (const blob of await listAllBlobs(BLOB_META_PREFIX)) {
+    const code = metaCodeFromPathname(blob.pathname);
+    if (!code) continue;
+    const current = latest.get(code);
+    if (!current || newestBlobFirst(blob, current) < 0) latest.set(code, blob);
+  }
+  return latest;
+}
+
 async function readMetaFromBlob(code) {
-  let info;
+  let versions;
   try {
-    info = await head(blobMetaPathname(code), { token: BLOB_TOKEN });
+    versions = (await listAllBlobs(`${BLOB_META_PREFIX}${code}.`))
+      .filter((blob) => metaCodeFromPathname(blob.pathname) === code)
+      .sort(newestBlobFirst);
   } catch (err) {
     if (isBlobMissing(err)) return null;
     throw err;
   }
 
-  try {
-    const response = await fetch(blobReadUrl(info.url, info.uploadedAt), { cache: 'no-store' });
-    if (!response.ok) return null;
-    return parseMeta(await response.json(), code);
-  } catch {
-    return null;
+  for (const blob of versions) {
+    try {
+      const response = await fetch(blob.url, { cache: 'no-store' });
+      if (!response.ok) continue;
+      const meta = parseMeta(await response.json(), code);
+      if (meta) return meta;
+    } catch {
+      // Try the next version; an unreadable sidecar must not block playback.
+    }
   }
+  return null;
 }
 
 async function readMeta(code) {
@@ -944,33 +993,21 @@ function compareRecordings(a, b) {
 
 async function listRecordingsFromBlob() {
   const recordings = [];
-  let cursor;
+  const latest = [...(await latestMetaBlobs()).values()];
 
-  do {
-    const page = await list({
-      prefix: BLOB_META_PREFIX,
-      cursor,
-      limit: 1000,
-      token: BLOB_TOKEN,
-    });
-
-    const sidecars = page.blobs.filter((blob) => blob.pathname.endsWith('.json'));
-    for (let index = 0; index < sidecars.length; index += 8) {
-      const batch = sidecars.slice(index, index + 8);
-      const results = await Promise.allSettled(batch.map(async (blob) => {
-        const code = blob.pathname.slice(BLOB_META_PREFIX.length, -'.json'.length);
-        if (!CODE_PATTERN.test(code)) return null;
-        const response = await fetch(blobReadUrl(blob.url, blob.uploadedAt), { cache: 'no-store' });
-        if (!response.ok) return null;
-        return parseMeta(await response.json(), code);
-      }));
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) recordings.push(result.value);
-      }
+  for (let index = 0; index < latest.length; index += 8) {
+    const batch = latest.slice(index, index + 8);
+    const results = await Promise.allSettled(batch.map(async (blob) => {
+      const code = metaCodeFromPathname(blob.pathname);
+      if (!code) return null;
+      const response = await fetch(blob.url, { cache: 'no-store' });
+      if (!response.ok) return null;
+      return parseMeta(await response.json(), code);
+    }));
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) recordings.push(result.value);
     }
-
-    cursor = page.hasMore ? page.cursor : undefined;
-  } while (cursor);
+  }
 
   return recordings.sort(compareRecordings);
 }
@@ -1036,11 +1073,10 @@ async function getPlayableRecording(code) {
 
 async function writeMeta(meta) {
   if (STORAGE_MODE === 'blob') {
-    await put(blobMetaPathname(meta.code), JSON.stringify(meta, null, 2), {
+    await put(blobMetaVersionPathname(meta.code), JSON.stringify(meta, null, 2), {
       access: 'public',
       contentType: 'application/json',
       addRandomSuffix: false,
-      allowOverwrite: true,
       cacheControlMaxAge: 60,
       token: BLOB_TOKEN,
     });
@@ -1088,7 +1124,16 @@ async function saveRecording(meta, buffer) {
 async function removeRecording(meta) {
   if (STORAGE_MODE === 'blob') {
     try {
-      await del([blobMetaPathname(meta.code), blobAudioPathname(meta)], { token: BLOB_TOKEN });
+      const versions = (await listAllBlobs(`${BLOB_META_PREFIX}${meta.code}.`))
+        .filter((blob) => metaCodeFromPathname(blob.pathname) === meta.code)
+        .map((blob) => blob.pathname);
+      if (versions.length) await del(versions, { token: BLOB_TOKEN });
+    } catch (err) {
+      if (!isBlobMissing(err)) console.warn(`Cleanup warning for ${meta.code}:`, err.message);
+    }
+
+    try {
+      await del(blobAudioPathname(meta), { token: BLOB_TOKEN });
     } catch (err) {
       if (!isBlobMissing(err)) console.warn(`Cleanup warning for ${meta.code}:`, err.message);
     }
@@ -1111,12 +1156,12 @@ async function allocateCode() {
     const code = randomCode(8);
 
     if (STORAGE_MODE === 'blob') {
-      try {
-        await head(blobMetaPathname(code), { token: BLOB_TOKEN });
-      } catch (err) {
-        if (isBlobMissing(err)) return code;
-        throw err;
-      }
+      const existing = await list({
+        prefix: `${BLOB_META_PREFIX}${code}.`,
+        limit: 1,
+        token: BLOB_TOKEN,
+      });
+      if (!existing.blobs.length) return code;
       continue;
     }
 
@@ -1129,30 +1174,21 @@ async function sweepExpired() {
   if (STORAGE_MODE === 'unavailable') return;
 
   if (STORAGE_MODE === 'blob') {
-    let cursor;
-    do {
-      const page = await list({
-        prefix: BLOB_META_PREFIX,
-        cursor,
-        limit: 1000,
-        token: BLOB_TOKEN,
-      });
-
-      for (const blob of page.blobs) {
-        if (!blob.pathname.endsWith('.json')) continue;
-        try {
-          const response = await fetch(blob.url, { cache: 'no-store' });
-          if (!response.ok) continue;
-          const meta = await response.json();
-          if (!meta || !meta.code || !meta.expiresAt) continue;
-          if (Date.parse(meta.expiresAt) <= Date.now()) await removeRecording(meta);
-        } catch {
-          // Ignore unreadable sidecars; they are harmless.
-        }
+    const latest = [...(await latestMetaBlobs()).values()];
+    const now = Date.now();
+    for (const blob of latest) {
+      try {
+        const code = metaCodeFromPathname(blob.pathname);
+        if (!code) continue;
+        const response = await fetch(blob.url, { cache: 'no-store' });
+        if (!response.ok) continue;
+        const meta = parseMeta(await response.json(), code);
+        if (!meta || !meta.expiresAt) continue;
+        if (Date.parse(meta.expiresAt) <= now) await removeRecording(meta);
+      } catch {
+        // Ignore unreadable sidecars; they are harmless.
       }
-
-      cursor = page.hasMore ? page.cursor : undefined;
-    } while (cursor);
+    }
     return;
   }
 
