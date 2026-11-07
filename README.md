@@ -203,7 +203,8 @@ Things to know before opening it to the public:
 ## How it works
 
 ```
-public/          Recorder UI, player styles, admin console styles and scripts
+public/          Player and admin styles/scripts, recorder assets, favicon
+views/           Recorder page served through the server-side block gate
 server.js        Express app: upload, storage, QR PNG, play page, audio delivery, admin auth
 api/index.js     Vercel serverless entrypoint
 vercel.json      Vercel rewrites, function limits, daily cleanup cron

@@ -70,6 +70,7 @@ const DATA_DIR = path.join(__dirname, 'data', 'recordings');
 const STATE_DIR = path.join(__dirname, 'data', 'state');
 const ACTIVITY_DIR = path.join(__dirname, 'data', 'activity');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const VIEWS_DIR = ON_VERCEL ? path.join(process.cwd(), 'views') : path.join(__dirname, 'views');
 const APP_URL_PATH = __dirname;
 const BLOB_META_PREFIX = 'echotag/meta/';
 const BLOB_AUDIO_PREFIX = 'echotag/audio/';
@@ -2626,10 +2627,10 @@ app.use('/admin', (req, res) => {
 });
 
 app.get(['/', '/index.html'], publicPageBlockGate, (req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+  res.sendFile(path.join(VIEWS_DIR, 'recorder.html'));
 });
 
-app.use(express.static(PUBLIC_DIR, { index: 'index.html', maxAge: 0 }));
+app.use(express.static(PUBLIC_DIR, { maxAge: 0 }));
 
 app.use('/api', (req, res) => {
   res.status(404).json({ error: 'Not found.' });
