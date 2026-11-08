@@ -63,7 +63,7 @@ const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const STUDENT_COOKIE = 'echotag_student';
 const STUDENT_SESSION_VERSION = 'v1';
 const STUDENT_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const STUDENT_LOGIN_LIMIT = 40;
+const STUDENT_LOGIN_LIMIT = 300;
 const STUDENT_LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const STUDENT_SESSION_SECRET = ADMIN_SESSION_SECRET
   || crypto.randomBytes(32).toString('base64url');
