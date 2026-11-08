@@ -3,7 +3,9 @@
 
   const STORAGE_KEY = 'echotag:identity';
   const NAME_PATTERN = /^[\p{L}\p{M} .'’\-]+$/u;
-  const ID_PATTERN = /^(?=.*\d)[A-Z0-9][A-Z0-9._/-]{0,29}$/;
+  const NUMBER_MIN = 1;
+  const NUMBER_MAX = 34;
+  const ID_PATTERN = /^(?:[1-9]|[1-2][0-9]|3[0-4])$/;
 
   function cleanName(raw) {
     return String(raw || '')
@@ -18,8 +20,7 @@
     return String(raw || '')
       .trim()
       .replace(/\s+/g, '')
-      .toUpperCase()
-      .slice(0, 30);
+      .replace(/^0+(?=\d)/, '');
   }
 
   function validate(value, grades) {
@@ -97,5 +98,7 @@
     cleanName,
     cleanId,
     ID_PATTERN,
+    NUMBER_MIN,
+    NUMBER_MAX,
   };
 })();

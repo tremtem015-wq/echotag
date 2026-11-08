@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>EchoTag — Student details</title>
-  <meta name="description" content="Enter your student details before recording a voice note with EchoTag.">
+  <title>EchoTag — Student sign-in</title>
+  <meta name="description" content="Sign in with your student details before recording a voice note with EchoTag.">
   <meta name="theme-color" content="#08080d">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
   <script src="/i18n.js" defer></script>
   <script src="/identity.js" defer></script>
+  <script src="/appmode.js" defer></script>
   <script src="/details.js" defer></script>
 </head>
 <body data-page="details">
@@ -44,6 +45,7 @@
       <nav class="site-nav" aria-label="Primary">
         <a href="/" aria-current="page" data-i18n="nav.details">Data entry</a>
         <a href="/record" data-i18n="nav.record">Voice recording</a>
+        <a href="/board" data-i18n="nav.board">Bulletin board</a>
       </nav>
       <label class="language-menu">
         <span class="sr-only" data-i18n="nav.language">Language</span>
@@ -57,19 +59,19 @@
 
   <main class="page entry-page">
     <section class="entry-intro">
-      <p class="eyebrow"><span class="pulse-dot" aria-hidden="true"></span> <span data-i18n="details.eyebrow">Student details · Step 1 of 2</span></p>
-      <h1 data-i18n="details.title">Tell us who<br><span class="gradient-text">is recording.</span></h1>
-      <p class="lede" data-i18n="details.lede">Enter your school details once. After that, you will move to a separate voice recording page — just like signing in before you start.</p>
+      <p class="eyebrow"><span class="pulse-dot" aria-hidden="true"></span> <span data-i18n="details.eyebrow">Student sign-in · Step 1 of 2</span></p>
+      <h1 data-i18n="details.title">Sign in before<br><span class="gradient-text">you record.</span></h1>
+      <p class="lede" data-i18n="details.lede">Enter your school details to sign in. Requests cannot be submitted until you do. After that, you will move to a separate voice recording page.</p>
       <ul class="points">
         <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point1">Your name, number, and grade stay attached to every note you record</span></li>
         <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point2">The administrator can review this information with the audio</span></li>
-        <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point3">Your details stay in this browser tab only</span></li>
+        <li><span class="point-icon" aria-hidden="true"></span> <span data-i18n="details.point3">Your sign-in lasts 12 hours on this device</span></li>
       </ul>
     </section>
 
     <section class="identity-card entry-card" aria-labelledby="identityHeading">
       <div class="identity-head">
-        <p class="section-kicker" data-i18n="details.step">Step 1 of 2</p>
+        <p class="section-kicker" data-i18n="details.step">Step 1 of 2 · Sign in</p>
         <span class="identity-state" id="identityState" data-state="required" data-i18n="details.stateRequired">Required</span>
       </div>
 
@@ -90,35 +92,23 @@
             <span class="field-label" data-i18n="details.fullName">Full name</span>
             <input id="studentNameInput" name="studentName" type="text" maxlength="80" placeholder="First and last name" data-i18n-placeholder="details.fullNamePlaceholder" autocomplete="name" spellcheck="false" required>
           </label>
+          <div class="field field-grade">
+            <span class="field-label" id="gradeLabel" data-i18n="details.grade">Grade level</span>
+            <div class="checkbox-group" id="gradeOptions" role="group" aria-labelledby="gradeLabel"></div>
+          </div>
           <label class="field">
             <span class="field-label" data-i18n="details.number">Number (เลขที่)</span>
-            <input id="studentIdInput" name="studentId" type="text" maxlength="30" placeholder="e.g. 12345" data-i18n-placeholder="details.numberPlaceholder" autocomplete="off" spellcheck="false" required>
-          </label>
-          <label class="field field-grade">
-            <span class="field-label" data-i18n="details.grade">Grade level</span>
-            <select id="gradeInput" name="grade" required>
-              <option value="" data-i18n="details.gradePlaceholder">Select grade</option>
-              <option value="M.1">M.1</option>
-              <option value="M.2">M.2</option>
-              <option value="M.3">M.3</option>
-              <option value="M.4">M.4</option>
-              <option value="M.5">M.5</option>
-              <option value="M.6">M.6</option>
-              <option value="G.7">G.7</option>
-              <option value="G.8">G.8</option>
-              <option value="G.9">G.9</option>
-              <option value="G.10">G.10</option>
-              <option value="G.11">G.11</option>
-              <option value="G.12">G.12</option>
+            <select id="studentIdInput" name="studentId" required disabled>
+              <option value="" data-i18n="details.numberPlaceholder">Select number</option>
             </select>
           </label>
         </div>
 
-        <p class="identity-hint" id="identityHint" data-i18n="details.hint">Enter your full name, number, and grade to continue.</p>
-        <button class="btn btn-primary entry-submit" id="continueBtn" type="submit" disabled data-i18n="details.continue">Continue to voice recording</button>
+        <p class="identity-hint" id="identityHint" data-i18n="details.hint">Enter your full name, select your grade and number to sign in.</p>
+        <button class="btn btn-primary entry-submit" id="continueBtn" type="submit" disabled data-i18n="details.continue">Sign in and start recording</button>
       </form>
 
-      <p class="entry-note" data-i18n="details.note">After you continue, the recorder opens on its own page. Use “Change details” there if you need to come back.</p>
+      <p class="entry-note" data-i18n="details.note">Your sign-in lasts 12 hours on this device. Use “Sign out” on the recorder to end it.</p>
     </section>
   </main>
 

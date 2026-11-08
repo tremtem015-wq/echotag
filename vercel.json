@@ -5,6 +5,7 @@
     { "source": "/index.html", "destination": "/api/index" },
     { "source": "/details", "destination": "/api/index" },
     { "source": "/record", "destination": "/api/index" },
+    { "source": "/board", "destination": "/api/index" },
     { "source": "/api/:path*", "destination": "/api/index" },
     { "source": "/admin", "destination": "/api/index" },
     { "source": "/admin/:path*", "destination": "/api/index" },

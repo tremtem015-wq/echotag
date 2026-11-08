@@ -60,6 +60,13 @@ const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const ADMIN_LOGIN_CSRF_TTL_MS = 30 * 60 * 1000;
 const ADMIN_LOGIN_LIMIT = 8;
 const ADMIN_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const STUDENT_COOKIE = 'echotag_student';
+const STUDENT_SESSION_VERSION = 'v1';
+const STUDENT_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const STUDENT_LOGIN_LIMIT = 40;
+const STUDENT_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const STUDENT_SESSION_SECRET = ADMIN_SESSION_SECRET
+  || crypto.randomBytes(32).toString('base64url');
 const SCRYPT_N = 16384;
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
@@ -80,10 +87,13 @@ const STATE_CACHE_TTL_MS = 5_000;
 const PRESENCE_TTL_MS = 2 * 60 * 1000;
 const PRESENCE_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const ACTIVITY_LIMIT = 400;
-const GRADE_LEVELS = Object.freeze([
-  'M.1', 'M.2', 'M.3', 'M.4', 'M.5', 'M.6',
-  'G.7', 'G.8', 'G.9', 'G.10', 'G.11', 'G.12',
-]);
+const BOARD_LIMIT = 50;
+const BOARD_TITLE_MAX = 120;
+const BOARD_BODY_MAX = 4000;
+const BOARD_POST_ID = /^[A-Za-z0-9_-]{8,32}$/;
+const GRADE_LEVELS = Object.freeze(['M2', 'G8']);
+const NUMBER_MIN = 1;
+const NUMBER_MAX = 34;
 
 if (STORAGE_MODE === 'file') {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -280,11 +290,10 @@ function cleanStudentId(raw) {
   const value = String(raw || '')
     .trim()
     .replace(/\s+/g, '')
-    .toUpperCase()
-    .slice(0, 30);
+    .replace(/^0+(?=\d)/, '');
 
-  if (!/^(?=.*\d)[A-Z0-9][A-Z0-9._/-]{0,29}$/.test(value)) {
-    return { error: 'Enter a number with 1–30 characters, including at least one digit.' };
+  if (!/^(?:[1-9]|[1-2][0-9]|3[0-4])$/.test(value)) {
+    return { error: `Select a number from ${NUMBER_MIN} to ${NUMBER_MAX}.` };
   }
   return { value };
 }
@@ -770,6 +779,86 @@ async function removeIpBlock(ip) {
     blocks: blocks.filter((block) => normalizeIp(block.ip) !== normalized),
   });
   return record;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulletin board                                                      */
+/* ------------------------------------------------------------------ */
+
+function cleanBoardTitle(raw) {
+  return String(raw || '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/[<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, BOARD_TITLE_MAX);
+}
+
+function cleanBoardBody(raw) {
+  return String(raw || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/[<>]/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, BOARD_BODY_MAX);
+}
+
+function readBoardInput(body) {
+  const title = cleanBoardTitle(body && body.title);
+  const text = cleanBoardBody(body && body.body);
+  const errors = [];
+  if (title.length < 2) errors.push('Enter a bulletin title.');
+  if (text.length < 2) errors.push('Enter a bulletin message.');
+  return {
+    ok: errors.length === 0,
+    errors,
+    post: errors.length === 0 ? { title, body: text } : null,
+  };
+}
+
+function normalizeBoardPosts(doc) {
+  const posts = Array.isArray(doc && doc.posts) ? doc.posts : [];
+  return posts
+    .filter((post) => post
+      && BOARD_POST_ID.test(String(post.id))
+      && typeof post.title === 'string'
+      && typeof post.body === 'string')
+    .map((post) => ({
+      id: String(post.id),
+      title: post.title.slice(0, BOARD_TITLE_MAX),
+      body: post.body.slice(0, BOARD_BODY_MAX),
+      author: typeof post.author === 'string' ? post.author.slice(0, 80) : 'Administrator',
+      createdAt: typeof post.createdAt === 'string' ? post.createdAt : '',
+    }))
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+async function listBoardPosts({ force = false } = {}) {
+  const doc = await readStateDocument('board', { posts: [] }, { force });
+  return normalizeBoardPosts(doc).slice(0, BOARD_LIMIT);
+}
+
+async function addBoardPost({ title, body, author }) {
+  const existing = await listBoardPosts({ force: true });
+  const post = {
+    id: crypto.randomBytes(9).toString('base64url'),
+    title,
+    body,
+    author: String(author || 'Administrator').slice(0, 80),
+    createdAt: new Date().toISOString(),
+  };
+  await writeStateDocument('board', { posts: [post, ...existing].slice(0, BOARD_LIMIT) });
+  return post;
+}
+
+async function removeBoardPost(id) {
+  if (!BOARD_POST_ID.test(String(id || ''))) return null;
+  const existing = await listBoardPosts({ force: true });
+  const removed = existing.find((post) => post.id === id);
+  if (!removed) return null;
+  await writeStateDocument('board', { posts: existing.filter((post) => post.id !== id) });
+  return removed;
 }
 
 function blockedApiResponse(res, block) {
@@ -1487,12 +1576,12 @@ function requestIsSecure(req) {
   return forwardedProto === 'https';
 }
 
-function buildCookie(req, name, value, maxAgeSeconds, path = '/') {
+function buildCookie(req, name, value, maxAgeSeconds, path = '/', sameSite = 'Strict') {
   const parts = [
     `${name}=${value}`,
     `Path=${path}`,
     'HttpOnly',
-    'SameSite=Strict',
+    `SameSite=${sameSite}`,
     `Max-Age=${maxAgeSeconds}`,
   ];
   if (requestIsSecure(req)) parts.push('Secure');
@@ -1704,6 +1793,81 @@ function requireAdminCsrf(req, res, next) {
   next();
 }
 
+/* ------------------------------------------------------------------ */
+/* Student sign-in session                                             */
+/* ------------------------------------------------------------------ */
+
+function studentHmac(value) {
+  return crypto.createHmac('sha256', STUDENT_SESSION_SECRET)
+    .update(`student-session-v1:${value}`)
+    .digest('base64url');
+}
+
+function createStudentSession(student) {
+  const issuedAt = Date.now();
+  const payload = {
+    v: 1,
+    s: {
+      name: student.name,
+      id: student.id,
+      grade: student.grade,
+    },
+    iat: issuedAt,
+    exp: issuedAt + STUDENT_SESSION_TTL_MS,
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  return { token: `${STUDENT_SESSION_VERSION}.${body}.${studentHmac(body)}`, payload };
+}
+
+function readStudentSession(req) {
+  const token = parseCookies(req)[STUDENT_COOKIE];
+  if (!token) return null;
+
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts[0] !== STUDENT_SESSION_VERSION) return null;
+  if (!safeEqual(parts[2], studentHmac(parts[1]))) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+
+  if (!payload || payload.v !== 1 || !payload.s || typeof payload.s !== 'object') return null;
+  if (!Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) return null;
+  const now = Date.now();
+  if (payload.exp <= now || payload.iat > now + 60_000) return null;
+  if (payload.exp - payload.iat > STUDENT_SESSION_TTL_MS + 60_000) return null;
+
+  const identity = readStudentInput({
+    studentName: payload.s.name,
+    studentId: payload.s.id,
+    grade: payload.s.grade,
+  });
+  if (!identity.ok) return null;
+
+  return { ...payload, student: identity.student };
+}
+
+function studentCookie(req, value, maxAgeSeconds) {
+  return buildCookie(req, STUDENT_COOKIE, value, maxAgeSeconds, '/', 'Lax');
+}
+
+function requireStudentSession(req, res, next) {
+  const session = readStudentSession(req);
+  if (!session) {
+    res.set('Cache-Control', 'no-store');
+    res.status(401).json({
+      error: 'Sign in with your student details before submitting.',
+      signInRequired: true,
+    });
+    return;
+  }
+  req.studentSession = session;
+  next();
+}
+
 const adminForm = express.urlencoded({ extended: false, limit: '16kb' });
 
 const loginLimiter = createLimiter({
@@ -1718,6 +1882,12 @@ const loginLimiter = createLimiter({
       'Try again later',
     ));
   },
+});
+
+const studentLoginLimiter = createLimiter({
+  limit: STUDENT_LOGIN_LIMIT,
+  windowMs: STUDENT_LOGIN_WINDOW_MS,
+  message: 'Too many sign-in attempts from this device. Wait a few minutes, then try again.',
 });
 
 /* ------------------------------------------------------------------ */
@@ -1825,7 +1995,84 @@ app.get('/api/config', publicApiBlockGate, (req, res) => {
     storage: STORAGE_MODE,
     uploadEnabled: STORAGE_MODE !== 'unavailable',
     grades: GRADE_LEVELS,
+    numberRange: { min: NUMBER_MIN, max: NUMBER_MAX },
   });
+});
+
+app.get('/api/board', publicApiBlockGate, async (req, res, next) => {
+  try {
+    const posts = await listBoardPosts({ force: true });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, posts });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/session', publicApiBlockGate, (req, res) => {
+  const session = readStudentSession(req);
+  res.set('Cache-Control', 'no-store');
+  if (!session) {
+    res.status(401).json({ ok: false, signedIn: false });
+    return;
+  }
+  res.json({
+    ok: true,
+    signedIn: true,
+    student: session.student,
+    expiresAt: new Date(session.exp).toISOString(),
+  });
+});
+
+app.post('/api/login', publicApiBlockGate, studentLoginLimiter, express.json({ limit: '8kb' }), (req, res) => {
+  if (!isSameOriginRequest(req)) {
+    res.status(403).json({ error: 'Cross-origin sign-in was blocked.' });
+    return;
+  }
+
+  const identity = readStudentInput(req.body && typeof req.body === 'object' ? req.body : {});
+  if (!identity.ok) {
+    res.status(400).json({ error: identity.errors.join(' '), fields: identity.errors });
+    return;
+  }
+
+  const session = createStudentSession(identity.student);
+  res.append('Set-Cookie', studentCookie(
+    req,
+    session.token,
+    Math.floor(STUDENT_SESSION_TTL_MS / 1000),
+  ));
+  res.set('Cache-Control', 'no-store');
+  logActivity({
+    type: 'student.login',
+    ip: clientIp(req),
+    student: identity.student,
+    detail: 'Student signed in before recording.',
+  }).catch((err) => console.warn('Activity log warning:', err.message));
+  res.json({
+    ok: true,
+    student: identity.student,
+    expiresAt: new Date(session.payload.exp).toISOString(),
+  });
+});
+
+app.post('/api/logout', publicApiBlockGate, express.json({ limit: '2kb' }), (req, res) => {
+  if (!isSameOriginRequest(req)) {
+    res.status(403).json({ error: 'Cross-origin sign-out was blocked.' });
+    return;
+  }
+  const session = readStudentSession(req);
+  res.append('Set-Cookie', studentCookie(req, '', 0));
+  res.set('Cache-Control', 'no-store');
+  if (session) {
+    logActivity({
+      type: 'student.logout',
+      ip: clientIp(req),
+      student: session.student,
+      detail: 'Student signed out.',
+    }).catch((err) => console.warn('Activity log warning:', err.message));
+  }
+  res.status(204).end();
 });
 
 function requireStorage(req, res, next) {
@@ -1838,18 +2085,13 @@ function requireStorage(req, res, next) {
   next();
 }
 
-app.post('/api/recordings', publicApiBlockGate, uploadLimiter, requireStorage, upload.single('audio'), async (req, res, next) => {
+app.post('/api/recordings', publicApiBlockGate, uploadLimiter, requireStorage, requireStudentSession, upload.single('audio'), async (req, res, next) => {
   try {
     if (!req.file || !req.file.size) throw httpError(400, 'No audio was uploaded.');
     if (req.file.size < 100) throw httpError(400, 'That audio file looks empty.');
     if (req.file.size > MAX_BYTES) throw httpError(413, 'That recording is too large.');
 
-    const identity = readStudentInput(req.body);
-    if (!identity.ok) {
-      const err = httpError(400, identity.errors.join(' '));
-      err.fields = identity.errors;
-      throw err;
-    }
+    const identity = { ok: true, student: req.studentSession.student };
 
     const mime = sniffAudioMime(req.file.buffer);
     if (!mime) throw httpError(415, 'Unsupported audio format. Please record again in your browser.');
@@ -2571,7 +2813,7 @@ app.post('/admin/admins/:username/remove', requireAdminConfigured, adminForm, re
 
 app.get('/admin/activity', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
   try {
-    const category = ['all', 'visitors', 'recordings', 'moderation', 'security', 'admins'].includes(String(req.query.category || ''))
+    const category = ['all', 'visitors', 'recordings', 'moderation', 'security', 'admins', 'board'].includes(String(req.query.category || ''))
       ? String(req.query.category)
       : 'all';
     const query = String(req.query.q || '').trim().slice(0, 100);
@@ -2617,6 +2859,62 @@ app.get('/admin/activity', requireAdminConfigured, requireAdminSession, async (r
   }
 });
 
+app.get('/admin/board', requireAdminConfigured, requireAdminSession, async (req, res, next) => {
+  try {
+    const posts = await listBoardPosts({ force: true });
+    sendAdminPage(res, 200, renderAdminBoardPage({
+      csrf: req.adminSession.csrf,
+      posts,
+      status: String(req.query.status || ''),
+    }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/board', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const input = readBoardInput(req.body);
+    if (!input.ok) {
+      adminRedirect(res, '/admin/board?status=post-invalid');
+      return;
+    }
+
+    const post = await addBoardPost({
+      ...input.post,
+      author: req.adminSession.u,
+    });
+    await logActivity({
+      type: 'board.posted',
+      ip: clientIp(req),
+      admin: req.adminSession.u,
+      detail: post.title,
+    }).catch((err) => console.warn('Activity log warning:', err.message));
+    adminRedirect(res, '/admin/board?status=posted');
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/admin/board/:id/delete', requireAdminConfigured, adminForm, requireAdminSession, requireAdminCsrf, async (req, res, next) => {
+  try {
+    const post = await removeBoardPost(String(req.params.id || ''));
+    if (!post) {
+      adminRedirect(res, '/admin/board?status=post-missing');
+      return;
+    }
+    await logActivity({
+      type: 'board.removed',
+      ip: clientIp(req),
+      admin: req.adminSession.u,
+      detail: post.title,
+    }).catch((err) => console.warn('Activity log warning:', err.message));
+    adminRedirect(res, '/admin/board?status=post-removed');
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/admin', (req, res) => {
   sendAdminPage(res, 404, renderAdminErrorPage(
     'Admin page not found',
@@ -2630,8 +2928,22 @@ app.get(['/', '/index.html', '/details'], publicPageBlockGate, (req, res) => {
   res.sendFile(path.join(VIEWS_DIR, 'details.html'));
 });
 
-app.get('/record', publicPageBlockGate, (req, res) => {
-  res.sendFile(path.join(VIEWS_DIR, 'recorder.html'));
+app.get('/record', publicPageBlockGate, (req, res, next) => {
+  try {
+    const session = readStudentSession(req);
+    if (!session) {
+      res.set('Cache-Control', 'no-store');
+      res.redirect(303, '/');
+      return;
+    }
+    res.sendFile(path.join(VIEWS_DIR, 'recorder.html'));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/board', publicPageBlockGate, (req, res) => {
+  res.sendFile(path.join(VIEWS_DIR, 'board.html'));
 });
 
 app.use(express.static(PUBLIC_DIR, { maxAge: 0 }));
@@ -2999,6 +3311,7 @@ const ADMIN_NAV_ITEMS = Object.freeze([
   { id: 'dashboard', label: 'Recordings', href: '/admin/dashboard' },
   { id: 'screening', label: 'Screening', href: '/admin/screening' },
   { id: 'users', label: 'Active users', href: '/admin/users' },
+  { id: 'board', label: 'Bulletin board', href: '/admin/board' },
   { id: 'admins', label: 'Administrators', href: '/admin/admins' },
   { id: 'activity', label: 'Activity log', href: '/admin/activity' },
 ]);
@@ -3090,10 +3403,11 @@ function renderStudentIdentity(meta, { compact = true } = {}) {
 function activityCategory(type) {
   const value = String(type || '');
   if (value === 'admin.recording_deleted') return 'recordings';
+  if (value.startsWith('board.')) return 'board';
   if (value.startsWith('moderation.')) return 'moderation';
   if (value.startsWith('ip.') || value === 'admin.login_failed') return 'security';
   if (value.startsWith('admin.')) return 'admins';
-  if (value === 'recording.viewed' || value.startsWith('visitor.')) return 'visitors';
+  if (value === 'recording.viewed' || value.startsWith('visitor.') || value.startsWith('student.')) return 'visitors';
   if (value.startsWith('recording.')) return 'recordings';
   return 'other';
 }
@@ -3115,6 +3429,10 @@ const ACTIVITY_LABELS = Object.freeze({
   'ip.unblocked': 'IP address unblocked',
   'visitor.recorder': 'Recorder page active',
   'visitor.player': 'Player page active',
+  'student.login': 'Student signed in',
+  'student.logout': 'Student signed out',
+  'board.posted': 'Bulletin posted',
+  'board.removed': 'Bulletin removed',
 });
 
 const ACTIVITY_CATEGORY_LABELS = Object.freeze({
@@ -3124,6 +3442,7 @@ const ACTIVITY_CATEGORY_LABELS = Object.freeze({
   moderation: 'Moderation',
   security: 'Security',
   admins: 'Administrators',
+  board: 'Bulletin board',
 });
 
 function activityLabel(type) {
@@ -3584,6 +3903,82 @@ function renderAdminManagementPage({ csrf, admins, currentUsername, status }) {
     csrf,
     active: 'admins',
     refreshHref: '/admin/admins',
+    content,
+  });
+}
+
+function renderAdminBoardPage({ csrf, posts, status }) {
+  const statusMessages = {
+    posted: 'The bulletin is live on the public board.',
+    'post-removed': 'The bulletin was removed from the public board.',
+    'post-missing': 'That bulletin was already gone.',
+    'post-invalid': 'Add a title and a message before posting.',
+  };
+
+  const postCards = posts.map((post) => `<article class="board-admin-post">
+    <div class="board-admin-head">
+      <h3>${escapeHtml(post.title)}</h3>
+      <span class="board-admin-meta">${escapeHtml(post.author || 'Administrator')} · ${escapeHtml(relativeTime(post.createdAt))}</span>
+    </div>
+    <p class="board-admin-body">${escapeHtml(post.body)}</p>
+    <form method="post" action="/admin/board/${encodeURIComponent(post.id)}/delete" data-confirm="Remove “${escapeHtml(post.title)}” from the public bulletin board?">
+      <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+      <button class="button danger small" type="submit">Remove post</button>
+    </form>
+  </article>`).join('');
+
+  const content = `
+    <section class="admin-hero">
+      <p class="eyebrow"><span class="eyebrow-dot"></span> Public bulletin board</p>
+      <h1>Post announcements for everyone.</h1>
+      <p class="hero-copy">Every bulletin is readable by anyone who visits the board. Only administrators can post or remove announcements. The board keeps the ${BOARD_LIMIT} most recent posts.</p>
+      <div class="stats">
+        <div class="stat"><span>Live bulletins</span><strong>${posts.length}</strong></div>
+        <div class="stat"><span>Board limit</span><strong>${BOARD_LIMIT}</strong></div>
+      </div>
+    </section>
+
+    ${renderAdminStatus(status, statusMessages)}
+
+    <section class="panel panel-pad">
+      <div class="toolbar toolbar-bare">
+        <div>
+          <h2>New bulletin</h2>
+          <p>The title and message appear immediately on the public board.</p>
+        </div>
+      </div>
+      <form class="board-compose" method="post" action="/admin/board">
+        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+        <label class="field">
+          <span>Title</span>
+          <input type="text" name="title" minlength="2" maxlength="${BOARD_TITLE_MAX}" placeholder="Exam schedule update" required>
+        </label>
+        <label class="field">
+          <span>Message</span>
+          <textarea name="body" rows="5" minlength="2" maxlength="${BOARD_BODY_MAX}" placeholder="Write the announcement students should see." required></textarea>
+        </label>
+        <button class="button primary" type="submit">Publish bulletin</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <h2>Published bulletins</h2>
+          <p>${posts.length} ${posts.length === 1 ? 'post' : 'posts'} · newest first</p>
+        </div>
+        <a class="button ghost small" href="/board" target="_blank" rel="noopener">Open public board</a>
+      </div>
+      <div class="board-admin-list">
+        ${posts.length ? postCards : '<div class="empty-state"><h3>No bulletins yet</h3><p>Publish the first announcement using the form above.</p></div>'}
+      </div>
+    </section>`;
+
+  return renderAdminPageFrame({
+    title: 'Bulletin board',
+    csrf,
+    active: 'board',
+    refreshHref: '/admin/board',
     content,
   });
 }

@@ -6,10 +6,7 @@
   const HISTORY_KEY = 'echotag:history';
   const DEFAULT_MAX_SECONDS = 300;
   const PRESENCE_INTERVAL_MS = 45000;
-  const DEFAULT_GRADES = [
-    'M.1', 'M.2', 'M.3', 'M.4', 'M.5', 'M.6',
-    'G.7', 'G.8', 'G.9', 'G.10', 'G.11', 'G.12',
-  ];
+  const DEFAULT_GRADES = ['M2', 'G8'];
 
   const els = {
     statusBadge: $('statusBadge'),
@@ -56,6 +53,7 @@
     recentList: $('recentList'),
     toast: $('toast'),
     retentionNote: $('retentionNote'),
+    signOut: $('studentSignOut'),
     maxMinuteLabels: document.querySelectorAll('[data-max-minutes]'),
   };
 
@@ -133,6 +131,10 @@
     els.applyBaseBtn.addEventListener('click', applyBase);
     els.deleteBtn.addEventListener('click', deleteCurrent);
 
+    if (els.signOut) {
+      els.signOut.addEventListener('click', signOut);
+    }
+
     els.baseInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
@@ -167,8 +169,13 @@
 
     renderHistory();
     applyConfigToUi();
-    if (!loadIdentityGate()) return;
-    startPresence();
+    loadIdentityGate()
+      .then((identity) => {
+        if (identity) startPresence();
+      })
+      .catch(() => {
+        window.location.replace('/');
+      });
     loadConfig();
   }
 
@@ -191,7 +198,6 @@
         config.grades = data.grades.map((grade) => String(grade).toUpperCase());
       }
       applyConfigToUi();
-      loadIdentityGate();
     } catch {
       // Offline config fetch is non-fatal; the defaults still work.
     }
@@ -221,11 +227,41 @@
     return EchoTagIdentity.validate(stored || {}, config.grades);
   }
 
-  function loadIdentityGate() {
-    const identity = readStoredIdentity();
-    if (!identity.ok) {
+  async function loadIdentityGate() {
+    let identity = null;
+
+    try {
+      const response = await fetch('/api/session', {
+        headers: { Accept: 'application/json' },
+        cache: 'no-store',
+      });
+
+      if (response.status === 403) {
+        const data = await response.json().catch(() => null);
+        if (data && data.blocked) enterBlockedState(data);
+        return null;
+      }
+
+      if (response.ok) {
+        const data = await response.json().catch(() => null);
+        if (data && data.signedIn && data.student) {
+          const verified = EchoTagIdentity.validate(data.student, config.grades);
+          if (verified.ok) {
+            identity = verified;
+            EchoTagIdentity.save(verified.student);
+          }
+        }
+      }
+    } catch {
+      // If the session check cannot run, a freshly saved identity keeps the UI usable.
+      const stored = readStoredIdentity();
+      if (stored.ok) identity = stored;
+    }
+
+    if (!identity || !identity.ok) {
       studentIdentity = null;
       els.recordBtn.disabled = true;
+      if (els.signOut) els.signOut.hidden = true;
       window.location.replace('/');
       return null;
     }
@@ -235,7 +271,26 @@
     els.recordLock.textContent = EchoTagI18n.t('recorder.identityUnlocked');
     els.recordLock.classList.add('is-ready');
     els.recordBtn.disabled = state.blocked;
+    if (els.signOut) els.signOut.hidden = false;
     return identity;
+  }
+
+  async function signOut() {
+    if (els.signOut) els.signOut.disabled = true;
+    try {
+      await fetch('/api/logout', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+    } catch {
+      // Even if the request fails, clear the local identity and leave the recorder.
+    }
+    EchoTagIdentity.clear();
+    window.location.replace('/');
   }
 
   function renderIdentitySummary() {
@@ -644,7 +699,9 @@
     els.baseInput.value = '';
 
     setView('idle');
-    loadIdentityGate();
+    loadIdentityGate().catch(() => {
+      window.location.replace('/');
+    });
   }
 
   function stopStream() {
@@ -871,6 +928,12 @@
       if (!response.ok) {
         if (data && data.blocked) {
           enterBlockedState(data);
+          return;
+        }
+        if (response.status === 401 && data && data.signInRequired) {
+          EchoTagIdentity.clear();
+          showError('Your sign-in expired. Returning to the sign-in page…');
+          window.setTimeout(() => window.location.replace('/'), 900);
           return;
         }
         if (data && Array.isArray(data.fields) && data.fields.length) {

@@ -1,6 +1,6 @@
 # EchoTag
 
-Record a voice note in the browser, get a QR code, and let anyone play it from their phone. No app, no account, no database. Students must identify themselves before recording, and administrators can screen audio, block abusive connections, and review an activity log.
+Record a voice note in the browser, get a QR code, and let anyone play it from their phone. No app, no password, no database. Students sign in with their school details before recording, everyone can read the public bulletin board, and administrators can screen audio, manage bulletins, block abusive connections, and review an activity log.
 
 **Live:** https://echotag-vert.vercel.app  
 **Repository:** https://github.com/tremtem015-wq/echotag
@@ -20,11 +20,13 @@ Then open **http://localhost:3000**.
 
 > On Windows PowerShell, `npm` may be blocked by the script execution policy. Use `npm.cmd install` or run `node server.js` after installing.
 
-Before the recorder unlocks, enter a full name, number (เลขที่), and grade level (`M.1`–`M.6` or `G.7`–`G.12`) on a separate data-entry page. The recorder is then unlocked for that browser tab, just like moving past a sign-in screen. The identity fields are validated in the browser and again on the server; a recording without a valid identity is rejected. A warning above the name field explains that fake, impersonating, or inappropriate names can lead to a block. The header language menu switches the public pages between English and Thai.
+Before the recorder unlocks, enter a full name, choose a grade (`M2` or `G8`), and select a number (เลขที่, 1–34) on a separate sign-in page. Submitting the form creates a signed, `HttpOnly` student session that lasts 12 hours; the recorder and upload routes reject requests without it, so the identity fields are no longer trusted from the client. A warning above the name field explains that fake, impersonating, or inappropriate names can lead to a block. The header language menu switches the public pages between English and Thai.
+
+The **Bulletin board** at `/board` is readable by everyone. Only administrators can publish or remove posts. An **App view** button in the header switches any public page into a phone-style shell with a fixed bottom navigation bar for sign-in, recording, and bulletins; the choice is remembered in `localStorage`.
 
 Click the mic, allow microphone access, record, stop, preview, add a title if you like, and create the QR code. The result screen lets you download the QR as a PNG, copy the link, open the player, or delete the recording.
 
-Local recordings are stored in `data/recordings/` as an audio file plus a small JSON sidecar. Dynamic admins, IP blocks, and the activity log live in `data/state/` and `data/activity/`, encrypted at rest.
+Local recordings are stored in `data/recordings/` as an audio file plus a small JSON sidecar. Dynamic admins, IP blocks, bulletin posts, and the activity log live in `data/state/` and `data/activity/`, encrypted at rest.
 
 ## Admin console
 
@@ -47,7 +49,7 @@ The script prints the password once and writes a private copy to `.secrets/admin
 
 Security properties:
 
-- Only a signed, `HttpOnly`, `SameSite=Strict` session cookie grants access. Sessions expire after 8 hours.
+- Only a signed, `HttpOnly`, `SameSite=Strict` session cookie grants access. Admin sessions expire after 8 hours; student sessions use a separate `SameSite=Lax` cookie and expire after 12 hours.
 - Passwords are verified with scrypt and timing-safe comparisons. No plaintext password fallback exists.
 - Every state-changing admin request requires a signed session plus a CSRF token. Login CSRF tokens are additionally bound to an `HttpOnly`, `SameSite=Strict` cookie; if a browser drops that cookie, a same-origin request with a valid signed token is still accepted.
 - Cross-origin request headers are logged as a warning and treated as defense-in-depth. The signed session, CSRF token, and `SameSite=Strict` cookies are the enforced checks, so reverse proxies and in-app browsers do not lock admins out.
@@ -79,13 +81,17 @@ The **Active users** page lists connections seen in the last few minutes, includ
 
 The **Administrators** page lists the built-in accounts from `ADMIN_USERNAME` / `ADMIN_USERS` and any accounts added from the console. New administrators get their own scrypt-hashed password and can sign in immediately. Built-in accounts can only be removed when they are not the account currently signed in; the console never lets the last active account delete itself.
 
+### Bulletin board
+
+The **Bulletin board** page at `/admin/board` publishes announcements to the public `/board` page. Posts are limited to 50, newest first, with a title (up to 120 characters) and message (up to 4,000 characters). Only administrators can add or remove posts, and every change is recorded in the activity log.
+
 ### Activity log
 
-The **Activity log** records uploads, public plays, moderation decisions, IP blocks and unblocks, administrator additions and removals, and admin sign-ins. Entries include the time, category, IP address where relevant, and a description, and can be filtered by category or searched.
+The **Activity log** records uploads, public plays, moderation decisions, IP blocks and unblocks, administrator additions and removals, student sign-ins and sign-outs, bulletin posts and removals, and admin sign-ins. Entries include the time, category, IP address where relevant, and a description, and can be filtered by category or searched.
 
 ### Encrypted moderation state
 
-Dynamic admins, IP blocks, activity entries, and stored student identity are encrypted with **AES-256-GCM** using a key derived from `ADMIN_SESSION_SECRET`. This keeps them unreadable in Blob storage or on disk. The trade-off: rotating `ADMIN_SESSION_SECRET` also makes existing dynamic admins, blocks, activity history, and student identity unreadable. Existing recordings still play, but their identity chips and moderation state may need to be recreated.
+Dynamic admins, IP blocks, bulletin posts, activity entries, and stored student identity are encrypted with **AES-256-GCM** using a key derived from `ADMIN_SESSION_SECRET`. This keeps them unreadable in Blob storage or on disk. The trade-off: rotating `ADMIN_SESSION_SECRET` also makes existing dynamic admins, blocks, bulletins, activity history, and student identity unreadable, and invalidates active student and admin sessions. Existing recordings still play, but their identity chips and moderation state may need to be recreated.
 
 ## Scanning from a phone
 

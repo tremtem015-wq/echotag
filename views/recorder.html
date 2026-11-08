@@ -13,6 +13,7 @@
   <link rel="stylesheet" href="/styles.css">
   <script src="/i18n.js" defer></script>
   <script src="/identity.js" defer></script>
+  <script src="/appmode.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body data-page="recorder">
@@ -47,6 +48,7 @@
       <nav class="site-nav" aria-label="Primary">
         <a href="/" data-i18n="nav.details">Data entry</a>
         <a href="/record" aria-current="page" data-i18n="nav.record">Voice recording</a>
+        <a href="/board" data-i18n="nav.board">Bulletin board</a>
       </nav>
       <label class="language-menu">
         <span class="sr-only" data-i18n="nav.language">Language</span>
@@ -55,6 +57,7 @@
           <option value="th">TH · ไทย</option>
         </select>
       </label>
+      <button class="signout-button" id="studentSignOut" type="button" hidden data-i18n="recorder.signOut">Sign out</button>
     </div>
   </header>
 
