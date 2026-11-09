@@ -147,6 +147,17 @@ The deployment includes `api/index.js` (the serverless entrypoint), `vercel.json
 - Supabase's free plan includes 1 GB of storage and 5 GB of egress per month. Audio playback is served from its CDN and does not pass through the Vercel function.
 - The browser still needs a tap to play when autoplay is blocked; that is a browser policy, not a bug.
 
+### Migrating old Blob recordings
+
+Recordings created before the Supabase migration stay in the old Blob store. Once Blob access is available again, copy them over with:
+
+```bash
+node --env-file=.env.local scripts/migrate-blob-to-supabase.js --dry-run
+node --env-file=.env.local scripts/migrate-blob-to-supabase.js
+```
+
+The script needs `BLOB_READ_WRITE_TOKEN` plus `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. It rewrites each recording's `audioUrl` to the new Supabase public URL. Existing Supabase metadata makes the script skip that recording, so it is safe to rerun; pass `--recordings-overwrite` to replace existing metadata. Activity entries are copied by their unique filenames. Encrypted state documents are only copied when `--state` is passed, and an existing state document is never replaced. Use `--only=meta,audio,state,activity` to limit a run.
+
 ### Deploy with the CLI instead
 
 ```bash
