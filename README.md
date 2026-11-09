@@ -91,7 +91,7 @@ The **Activity log** records uploads, public plays, moderation decisions, IP blo
 
 ### Encrypted moderation state
 
-Dynamic admins, IP blocks, bulletin posts, activity entries, and stored student identity are encrypted with **AES-256-GCM** using a key derived from `ADMIN_SESSION_SECRET`. This keeps them unreadable in Blob storage or on disk. The trade-off: rotating `ADMIN_SESSION_SECRET` also makes existing dynamic admins, blocks, bulletins, activity history, and student identity unreadable, and invalidates active student and admin sessions. Existing recordings still play, but their identity chips and moderation state may need to be recreated.
+Dynamic admins, IP blocks, bulletin posts, activity entries, and stored student identity are encrypted with **AES-256-GCM** using a key derived from `ADMIN_SESSION_SECRET`. This keeps them unreadable in Blob storage, the private Supabase bucket, or on disk. The trade-off: rotating `ADMIN_SESSION_SECRET` also makes existing dynamic admins, blocks, bulletins, activity history, and student identity unreadable, and invalidates active student and admin sessions. Existing recordings still play, but their identity chips and moderation state may need to be recreated.
 
 ## Scanning from a phone
 
@@ -120,12 +120,17 @@ Autoplay is also a browser decision. The player tries to start on its own; if th
 
 ## Deploy on Vercel
 
-Vercel's serverless filesystem is temporary, so production recordings are stored in **Vercel Blob**. The app detects a connected Blob store (`BLOB_STORE_ID` with OIDC, or `BLOB_READ_WRITE_TOKEN`) and switches storage automatically; without either, local development uses the filesystem.
+Vercel's serverless filesystem is temporary, so production uses **Supabase Storage** (recommended) or **Vercel Blob** (legacy fallback). The app picks storage in this order: Supabase when `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set, then Vercel Blob when a Blob store is connected (`BLOB_STORE_ID` with OIDC, or `BLOB_READ_WRITE_TOKEN`), then local disk for development.
+
+Supabase mode uses two buckets, created automatically on first use:
+
+- `echotag-media` — public bucket for audio (`audio/<code>.<ext>`); playback redirects to its public CDN URL.
+- `echotag-data` — private bucket for encrypted state, recording metadata, and activity entries (`state/`, `meta/`, `activity/`). Only the service-role key can read it.
 
 1. Push this repository to GitHub.
 2. In Vercel, choose **Add New → Project**, import the repository, and deploy. No build command is needed.
-3. In the project, open **Storage → Create → Blob**, create a store, and connect it to the project. The CLI connects it with OIDC by default, which sets `BLOB_STORE_ID`; token mode with `BLOB_READ_WRITE_TOKEN` also works.
-4. Redeploy (or trigger a new deployment) so the function receives the new environment variable.
+3. Open **Storage** (Marketplace) and add **Supabase** on the free plan, or connect an existing Supabase project. This sets `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` for Production, Preview, and Development. You can also set them manually in **Settings → Environment Variables**.
+4. Redeploy (or trigger a new deployment) so the function receives the new environment variables.
 5. Optional but recommended: add a `CRON_SECRET` environment variable (any long random string). The included daily cron at `/api/cron/sweep` uses it to delete expired recordings.
 6. Add `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, and `ADMIN_SESSION_SECRET` from `npm run admin:credentials -- --write`. Set them for Production (and Preview, if you test there), then redeploy.
 7. Optional: set `PUBLIC_BASE_URL` to your production URL, e.g. `https://echotag.vercel.app`. If unset, the app derives it from the incoming request.
@@ -139,6 +144,7 @@ The deployment includes `api/index.js` (the serverless entrypoint), `vercel.json
 - Function request bodies are capped at about 4.5 MB. On Vercel the app defaults to **180 seconds** and **4 MB** per recording, with the browser recording at 96 kbps.
 - Override with `MAX_RECORDING_SECONDS` and `MAX_UPLOAD_MB`, but keep uploads below the Vercel body limit. At 96 kbps, 180 seconds is roughly 2.2 MB.
 - Rate limits are in memory, so they are best-effort across serverless instances.
+- Supabase's free plan includes 1 GB of storage and 5 GB of egress per month. Audio playback is served from its CDN and does not pass through the Vercel function.
 - The browser still needs a tap to play when autoplay is blocked; that is a browser policy, not a bug.
 
 ### Deploy with the CLI instead
@@ -148,7 +154,7 @@ npx vercel
 npx vercel --prod
 ```
 
-After the first deploy, connect a Blob store in the Vercel dashboard and redeploy. Local `npx vercel dev` can also use a Blob store if `BLOB_READ_WRITE_TOKEN` is set in `.env.local`.
+After the first deploy, connect Supabase from the Vercel Marketplace (or set the two Supabase variables manually) and redeploy. Local `npx vercel dev` can also use the same Supabase project when `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are in `.env.local`; the app loads `.env` automatically, or start it with `node --env-file=.env.local server.js`.
 
 ## Configuration
 
@@ -161,8 +167,12 @@ Copy `.env.example` to `.env`, or set environment variables in your shell or Ver
 | `RETENTION_DAYS` | `30` | Days before recordings are deleted automatically. `0` keeps them until deleted. |
 | `MAX_RECORDING_SECONDS` | `300` local / `180` Vercel | Maximum recording length. |
 | `MAX_UPLOAD_MB` | `25` local / `4` Vercel | Maximum upload size in megabytes. |
-| `BLOB_READ_WRITE_TOKEN` | unset | Static Vercel Blob credential for local development or token mode. On Vercel, a connected Blob store can use OIDC instead (`BLOB_STORE_ID`). |
-| `BLOB_STORE_ID` | unset | Set automatically when a Blob store is connected with OIDC. Powers Blob storage together with Vercel's OIDC token. |
+| `SUPABASE_URL` | unset | Supabase project URL. When this and the service-role key are set, Supabase Storage is used first. |
+| `SUPABASE_SERVICE_ROLE_KEY` | unset | Supabase service-role key. Server-only; never expose it to the browser. |
+| `SUPABASE_MEDIA_BUCKET` | `echotag-media` | Public bucket for audio. Created automatically when missing. |
+| `SUPABASE_DATA_BUCKET` | `echotag-data` | Private bucket for encrypted state, metadata, and activity entries. Created automatically when missing. |
+| `BLOB_READ_WRITE_TOKEN` | unset | Legacy Vercel Blob credential for local development or token mode. Only used when Supabase is not configured. |
+| `BLOB_STORE_ID` | unset | Legacy Blob store ID set automatically when a Blob store is connected with OIDC. Only used when Supabase is not configured. |
 | `CRON_SECRET` | unset | Bearer token required by `/api/cron/sweep`. |
 | `ADMIN_USERNAME` | unset | Username for `/admin`. Admin stays disabled until at least one account and a session secret are valid. |
 | `ADMIN_PASSWORD_HASH` | unset | scrypt hash generated by `npm run admin:credentials`. Never a plaintext password. |
@@ -186,7 +196,7 @@ ADMIN_SESSION_SECRET=replace-with-a-long-random-string
 
 EchoTag is a normal Express app and can also run on a host with a persistent disk:
 
-- Mount persistent storage at `data/` and leave `BLOB_READ_WRITE_TOKEN` unset.
+- Mount persistent storage at `data/` and leave the Supabase and Blob variables unset.
 - Serve it over HTTPS. You need this to record from phones.
 - Set `PUBLIC_BASE_URL` to the public HTTPS URL so QR codes work off your local network.
 - If you put nginx or Caddy in front, set `TRUST_PROXY=1`.
@@ -221,15 +231,15 @@ data/activity/   Encrypted activity log (auto-created, ignored by git)
 .secrets/        Generated admin credentials (ignored by git)
 ```
 
-- Storage is behind a small adapter: local file mode, or Vercel Blob mode (`echotag/audio/...` and `echotag/meta/...`).
+- Storage is behind a small adapter with three modes: Supabase Storage (preferred; public `echotag-media` for audio, private `echotag-data` for state/meta/activity), Vercel Blob (`echotag/audio/...` and `echotag/meta/...`, legacy fallback), or local disk.
 - `/` is the data-entry screen and `/record` is the voice recorder. A valid identity is saved for the browser tab, so the recorder opens only after the data-entry step, like a sign-in screen. The header language menu switches the public pages between English and Thai.
-- Recording metadata and state documents are written as immutable, timestamped Blob versions. The newest version is discovered with `list`, so moderation, blocks, and admin changes take effect immediately instead of waiting for a CDN copy to expire.
+- In Blob mode, recording metadata and state documents are written as immutable, timestamped versions discovered with `list`, so moderation, blocks, and admin changes take effect immediately instead of waiting for a CDN copy to expire. In Supabase mode, state, metadata, and activity entries use fixed object keys and are overwritten in place; short in-memory caches (5–30 seconds) limit storage requests on serverless instances.
 - The browser records with `MediaRecorder`, choosing Opus/WebM, AAC/MP4, or Ogg depending on the browser.
 - Uploads must include a valid student identity and are scored from the browser's audio-level samples before storage. A server-side moderation record controls whether the public player and media routes expose the note.
 - The recorder and player send a lightweight presence heartbeat so the console can list active IP addresses. Blocks are checked on public page, API, QR, and media routes.
 - The server sniffs the uploaded bytes, validates the format, and stores the audio with a short random code.
 - QR codes are generated server-side with the [`qrcode`](https://www.npmjs.com/package/qrcode) package and point at `/p/<code>`.
-- In Blob mode, the player reads audio directly from the Blob CDN. Locally, `/media/<code>` streams the file with HTTP range support so seeking works.
+- In Supabase and Blob modes, the player and admin audio route redirect to the storage CDN. Locally, `/media/<code>` and `/admin/audio/<code>` stream the file with HTTP range support so seeking works.
 - Peak data captured during recording is used to draw the waveform on the player.
 - Expired recordings are removed lazily when opened, swept on startup and every six hours locally, and swept daily on Vercel by the cron job.
 

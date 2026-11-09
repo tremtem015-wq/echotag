@@ -34,7 +34,20 @@ const ON_VERCEL = Boolean(process.env.VERCEL);
 const BLOB_TOKEN = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
 const BLOB_STORE_ID = (process.env.BLOB_STORE_ID || '').trim();
 const BLOB_ENABLED = Boolean(BLOB_TOKEN || BLOB_STORE_ID);
-const STORAGE_MODE = BLOB_ENABLED ? 'blob' : ON_VERCEL ? 'unavailable' : 'file';
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '')
+  .trim()
+  .replace(/\/+$/, '');
+const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const SUPABASE_ENABLED = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
+const SUPABASE_MEDIA_BUCKET = (process.env.SUPABASE_MEDIA_BUCKET || 'echotag-media').trim();
+const SUPABASE_DATA_BUCKET = (process.env.SUPABASE_DATA_BUCKET || 'echotag-data').trim();
+const STORAGE_MODE = SUPABASE_ENABLED
+  ? 'supabase'
+  : BLOB_ENABLED
+    ? 'blob'
+    : ON_VERCEL
+      ? 'unavailable'
+      : 'file';
 const MAX_SECONDS = clampNumber(
   Number(process.env.MAX_RECORDING_SECONDS),
   5,
@@ -83,7 +96,13 @@ const BLOB_META_PREFIX = 'echotag/meta/';
 const BLOB_AUDIO_PREFIX = 'echotag/audio/';
 const BLOB_STATE_PREFIX = 'echotag/state/';
 const BLOB_ACTIVITY_PREFIX = 'echotag/activity/';
+const SUPABASE_AUDIO_PREFIX = 'audio/';
+const SUPABASE_META_PREFIX = 'meta/';
+const SUPABASE_STATE_PREFIX = 'state/';
+const SUPABASE_ACTIVITY_PREFIX = 'activity/';
 const STATE_CACHE_TTL_MS = 5_000;
+const META_CACHE_TTL_MS = 30_000;
+const RECORDINGS_CACHE_TTL_MS = 15_000;
 const PRESENCE_TTL_MS = 2 * 60 * 1000;
 const PRESENCE_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const ACTIVITY_LIMIT = 400;
@@ -553,6 +572,183 @@ function newestBlobFirst(a, b) {
   return String(b.pathname).localeCompare(String(a.pathname));
 }
 
+/* ------------------------------------------------------------------ */
+/* Supabase Storage                                                    */
+/* ------------------------------------------------------------------ */
+
+function encodeSupabasePath(value) {
+  return String(value).split('/').map((segment) => encodeURIComponent(segment)).join('/');
+}
+
+function supabaseHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_SERVICE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+    ...extra,
+  };
+}
+
+async function supabaseFetch(pathname, options = {}, timeoutMs = 20_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return await fetch(`${SUPABASE_URL}/storage/v1${pathname}`, {
+      ...options,
+      headers: supabaseHeaders(options.headers || {}),
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let supabaseBucketsReady = null;
+
+function ensureSupabaseBuckets() {
+  if (!SUPABASE_ENABLED) return Promise.resolve();
+  if (!supabaseBucketsReady) {
+    supabaseBucketsReady = (async () => {
+      await ensureSupabaseBucket(SUPABASE_MEDIA_BUCKET, true);
+      await ensureSupabaseBucket(SUPABASE_DATA_BUCKET, false);
+    })().catch((err) => {
+      supabaseBucketsReady = null;
+      throw err;
+    });
+  }
+  return supabaseBucketsReady;
+}
+
+async function ensureSupabaseBucket(id, isPublic) {
+  const check = await supabaseFetch(`/bucket/${encodeURIComponent(id)}`, { method: 'GET' });
+  if (check.ok) return;
+
+  const checkBody = await check.text().catch(() => '');
+  if (check.status !== 404 && !/not found|does not exist/i.test(checkBody)) {
+    throw new Error(`Supabase bucket check failed (${check.status})`);
+  }
+
+  const create = await supabaseFetch('/bucket', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, name: id, public: isPublic }),
+  });
+  if (!create.ok) {
+    const createBody = await create.text().catch(() => '');
+    if (!/already exists/i.test(createBody)) {
+      throw new Error(`Supabase bucket create failed (${create.status})`);
+    }
+  }
+}
+
+async function supabasePutObject(bucket, key, body, { contentType = 'application/octet-stream', cacheControl = 'no-store' } = {}) {
+  await ensureSupabaseBuckets();
+  const response = await supabaseFetch(`/object/${bucket}/${encodeSupabasePath(key)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': contentType,
+      'cache-control': cacheControl,
+      'x-upsert': 'true',
+    },
+    body: Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8'),
+  }, 30_000);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Supabase upload failed (${response.status}): ${text.slice(0, 160)}`);
+  }
+}
+
+async function supabaseDownload(bucket, key) {
+  await ensureSupabaseBuckets();
+  const response = await supabaseFetch(`/object/${bucket}/${encodeSupabasePath(key)}`, { method: 'GET' }, 30_000);
+  if (response.ok) return response;
+
+  const text = await response.text().catch(() => '');
+  if (response.status === 404 || (response.status === 400 && /not found|does not exist/i.test(text))) {
+    return null;
+  }
+  throw new Error(`Supabase download failed (${response.status}): ${text.slice(0, 160)}`);
+}
+
+async function supabaseDeleteObjects(bucket, keys) {
+  const prefixes = [...new Set(keys.filter(Boolean))];
+  if (!prefixes.length) return;
+
+  await ensureSupabaseBuckets();
+  const response = await supabaseFetch(`/object/${bucket}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prefixes }),
+  }, 30_000);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Supabase delete failed (${response.status}): ${text.slice(0, 160)}`);
+  }
+}
+
+async function supabaseListObjects(bucket, prefix, { limit = 1000, offset = 0, sortOrder = 'asc' } = {}) {
+  await ensureSupabaseBuckets();
+  const response = await supabaseFetch(`/object/list/${bucket}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prefix, limit, offset, sortBy: { column: 'name', order: sortOrder } }),
+  }, 30_000);
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Supabase list failed (${response.status}): ${text.slice(0, 160)}`);
+  }
+
+  const entries = await response.json().catch(() => []);
+  return Array.isArray(entries) ? entries.filter((entry) => entry && entry.id && entry.name) : [];
+}
+
+function supabaseAudioKey(meta) {
+  return `${SUPABASE_AUDIO_PREFIX}${meta.code}${extensionFor(meta)}`;
+}
+
+function supabasePublicMediaUrl(key) {
+  return `${SUPABASE_URL}/storage/v1/object/public/${SUPABASE_MEDIA_BUCKET}/${encodeSupabasePath(key)}`;
+}
+
+async function supabaseHeadObject(bucket, key) {
+  await ensureSupabaseBuckets();
+  const response = await supabaseFetch(`/object/${bucket}/${encodeSupabasePath(key)}`, { method: 'HEAD' });
+  if (response.ok) return true;
+  if (response.status === 400 || response.status === 404) return false;
+  throw new Error(`Supabase head failed (${response.status})`);
+}
+
+async function listAllSupabaseObjects(bucket, prefix, pageSize = 1000) {
+  const objects = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await supabaseListObjects(bucket, prefix, { limit: pageSize, offset });
+    objects.push(...page);
+    if (page.length < pageSize || offset > 100_000) break;
+  }
+  return objects;
+}
+
+function supabaseStateKey(name) {
+  return `${SUPABASE_STATE_PREFIX}${name}.json`;
+}
+
+function supabaseMetaKey(code) {
+  return `${SUPABASE_META_PREFIX}${code}.json`;
+}
+
+function supabaseActivityKey(stem) {
+  return `${SUPABASE_ACTIVITY_PREFIX}${stem}.json`;
+}
+
+function invalidateMetaCache(code) {
+  if (code) metaCache.delete(String(code));
+  else metaCache.clear();
+}
+
 async function readStateDocument(name, fallback, { force = false } = {}) {
   const cached = stateCache.get(name);
   if (!force && cached && Date.now() - cached.at < STATE_CACHE_TTL_MS) {
@@ -560,7 +756,14 @@ async function readStateDocument(name, fallback, { force = false } = {}) {
   }
 
   let raw = null;
-  if (STORAGE_MODE === 'blob') {
+  if (STORAGE_MODE === 'supabase') {
+    try {
+      const response = await supabaseDownload(SUPABASE_DATA_BUCKET, supabaseStateKey(name));
+      if (response) raw = await response.text();
+    } catch (err) {
+      console.warn(`State read warning (${name}):`, err.message);
+    }
+  } else if (STORAGE_MODE === 'blob') {
     try {
       const versions = (await listAllBlobs(`${BLOB_STATE_PREFIX}${name}.`)).sort(newestBlobFirst);
       for (const blob of versions) {
@@ -599,7 +802,12 @@ async function writeStateDocument(name, value) {
   if (STORAGE_MODE === 'unavailable') throw httpError(503, 'Storage is not connected.');
 
   const raw = encodeStoredDocument(value);
-  if (STORAGE_MODE === 'blob') {
+  if (STORAGE_MODE === 'supabase') {
+    await supabasePutObject(SUPABASE_DATA_BUCKET, supabaseStateKey(name), raw, {
+      contentType: 'application/json',
+      cacheControl: 'no-store',
+    });
+  } else if (STORAGE_MODE === 'blob') {
     await put(`${BLOB_STATE_PREFIX}${name}.${blobVersionSuffix()}.json`, raw, {
       access: 'public',
       contentType: 'application/json',
@@ -635,6 +843,14 @@ async function logActivity(event) {
   const raw = encodeStoredDocument(entry);
   const stem = activityFileStem();
 
+  if (STORAGE_MODE === 'supabase') {
+    await supabasePutObject(SUPABASE_DATA_BUCKET, supabaseActivityKey(stem), raw, {
+      contentType: 'application/json',
+      cacheControl: 'no-store',
+    });
+    return;
+  }
+
   if (STORAGE_MODE === 'blob') {
     await put(`${BLOB_ACTIVITY_PREFIX}${stem}.json`, raw, {
       access: 'public',
@@ -651,7 +867,19 @@ async function logActivity(event) {
 
 async function listActivityEntries(limit = ACTIVITY_LIMIT) {
   const names = [];
-  if (STORAGE_MODE === 'blob') {
+  if (STORAGE_MODE === 'supabase') {
+    try {
+      const page = await supabaseListObjects(SUPABASE_DATA_BUCKET, SUPABASE_ACTIVITY_PREFIX, { limit });
+      for (const object of page) {
+        if (String(object.name).endsWith('.json')) {
+          names.push({ key: `${SUPABASE_ACTIVITY_PREFIX}${object.name}` });
+        }
+      }
+    } catch (err) {
+      console.warn('Activity list warning:', err.message);
+      return [];
+    }
+  } else if (STORAGE_MODE === 'blob') {
     try {
       const page = await list({
         prefix: BLOB_ACTIVITY_PREFIX,
@@ -684,7 +912,11 @@ async function listActivityEntries(limit = ACTIVITY_LIMIT) {
     const batch = names.slice(index, index + 10);
     const results = await Promise.allSettled(batch.map(async (blob) => {
       let raw;
-      if (STORAGE_MODE === 'blob') {
+      if (STORAGE_MODE === 'supabase') {
+        const response = await supabaseDownload(SUPABASE_DATA_BUCKET, blob.key);
+        if (!response) return null;
+        raw = await response.text();
+      } else if (STORAGE_MODE === 'blob') {
         const response = await fetch(blob.url, { cache: 'no-store' });
         if (!response.ok) return null;
         raw = await response.text();
@@ -740,9 +972,10 @@ async function readBlocks({ force = false } = {}) {
 async function findBlockForIp(ip) {
   const normalized = normalizeIp(ip);
   if (!normalized) return null;
-  // Public gates must never consult a per-instance cache: an administrator's
-  // block or unblock has to apply on the very next request, on every instance.
-  const blocks = await readBlocks({ force: true });
+  // Public gates normally bypass the per-instance cache so an administrator's
+  // block applies immediately. Supabase reads cost a network round trip on
+  // every request, so allow the short cache window there instead.
+  const blocks = await readBlocks({ force: STORAGE_MODE !== 'supabase' });
   return blocks.find((block) => normalizeIp(block.ip) === normalized) || null;
 }
 
@@ -1063,17 +1296,58 @@ async function readMetaFromBlob(code) {
   return null;
 }
 
+const metaCache = new Map();
+const recordingsCache = { at: 0, value: null };
+
+function withSupabaseAudioUrl(meta) {
+  if (!meta || STORAGE_MODE !== 'supabase' || meta.audioUrl) return meta;
+  return { ...meta, audioUrl: supabasePublicMediaUrl(supabaseAudioKey(meta)) };
+}
+
+function rememberMeta(meta) {
+  if (meta) metaCache.set(String(meta.code), { at: Date.now(), value: meta });
+  return meta;
+}
+
+function invalidateRecordings() {
+  recordingsCache.at = 0;
+  recordingsCache.value = null;
+}
+
+async function readMetaFromSupabase(code) {
+  try {
+    const response = await supabaseDownload(SUPABASE_DATA_BUCKET, supabaseMetaKey(code));
+    if (!response) return null;
+    return withSupabaseAudioUrl(parseMeta(await response.json(), code));
+  } catch (err) {
+    console.warn(`Meta read warning (${code}):`, err.message);
+    return null;
+  }
+}
+
 async function readMeta(code) {
   if (!CODE_PATTERN.test(String(code || ''))) return null;
   if (STORAGE_MODE === 'unavailable') return null;
-  if (STORAGE_MODE === 'blob') return readMetaFromBlob(code);
 
-  try {
-    const raw = await fsp.readFile(path.join(DATA_DIR, `${code}.json`), 'utf8');
-    return parseMeta(JSON.parse(raw), code);
-  } catch {
-    return null;
+  const cached = metaCache.get(String(code));
+  if (cached && Date.now() - cached.at < META_CACHE_TTL_MS) return cached.value;
+
+  let meta = null;
+  if (STORAGE_MODE === 'supabase') {
+    meta = await readMetaFromSupabase(code);
+  } else if (STORAGE_MODE === 'blob') {
+    meta = await readMetaFromBlob(code);
+  } else {
+    try {
+      const raw = await fsp.readFile(path.join(DATA_DIR, `${code}.json`), 'utf8');
+      meta = parseMeta(JSON.parse(raw), code);
+    } catch {
+      meta = null;
+    }
   }
+
+  metaCache.set(String(code), { at: Date.now(), value: meta });
+  return meta;
 }
 
 function compareRecordings(a, b) {
@@ -1129,10 +1403,44 @@ async function listRecordingsFromDisk() {
   return recordings.sort(compareRecordings);
 }
 
+async function listRecordingsFromSupabase() {
+  const objects = await listAllSupabaseObjects(SUPABASE_DATA_BUCKET, SUPABASE_META_PREFIX);
+  const recordings = [];
+
+  for (let index = 0; index < objects.length; index += 8) {
+    const batch = objects.slice(index, index + 8);
+    const results = await Promise.allSettled(batch.map(async (object) => {
+      const name = String(object.name);
+      if (!name.endsWith('.json')) return null;
+      const code = name.slice(0, -'.json'.length);
+      if (!CODE_PATTERN.test(code)) return null;
+      const response = await supabaseDownload(SUPABASE_DATA_BUCKET, `${SUPABASE_META_PREFIX}${name}`);
+      if (!response) return null;
+      return withSupabaseAudioUrl(parseMeta(await response.json(), code));
+    }));
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) recordings.push(result.value);
+    }
+  }
+
+  return recordings.sort(compareRecordings);
+}
+
 async function listRecordings() {
   if (STORAGE_MODE === 'unavailable') return [];
-  if (STORAGE_MODE === 'blob') return listRecordingsFromBlob();
-  return listRecordingsFromDisk();
+  if (recordingsCache.value && Date.now() - recordingsCache.at < RECORDINGS_CACHE_TTL_MS) {
+    return recordingsCache.value;
+  }
+
+  const recordings = STORAGE_MODE === 'supabase'
+    ? await listRecordingsFromSupabase()
+    : STORAGE_MODE === 'blob'
+      ? await listRecordingsFromBlob()
+      : await listRecordingsFromDisk();
+
+  recordingsCache.at = Date.now();
+  recordingsCache.value = recordings;
+  return recordings;
 }
 
 async function getPlayableRecording(code) {
@@ -1141,6 +1449,11 @@ async function getPlayableRecording(code) {
   if (meta.expiresAt && Date.parse(meta.expiresAt) <= Date.now()) {
     await removeRecording(meta);
     return null;
+  }
+
+  if (STORAGE_MODE === 'supabase') {
+    const exists = await supabaseHeadObject(SUPABASE_MEDIA_BUCKET, supabaseAudioKey(meta));
+    return exists ? meta : null;
   }
 
   if (STORAGE_MODE === 'blob') {
@@ -1164,7 +1477,12 @@ async function getPlayableRecording(code) {
 }
 
 async function writeMeta(meta) {
-  if (STORAGE_MODE === 'blob') {
+  if (STORAGE_MODE === 'supabase') {
+    await supabasePutObject(SUPABASE_DATA_BUCKET, supabaseMetaKey(meta.code), JSON.stringify(meta, null, 2), {
+      contentType: 'application/json',
+      cacheControl: 'no-store',
+    });
+  } else if (STORAGE_MODE === 'blob') {
     await put(blobMetaVersionPathname(meta.code), JSON.stringify(meta, null, 2), {
       access: 'public',
       contentType: 'application/json',
@@ -1172,16 +1490,36 @@ async function writeMeta(meta) {
       cacheControlMaxAge: 60,
       token: BLOB_TOKEN,
     });
-    return;
+  } else {
+    const target = path.join(DATA_DIR, `${meta.code}.json`);
+    const temp = `${target}.${process.pid}.tmp`;
+    await fsp.writeFile(temp, JSON.stringify(meta, null, 2));
+    await fsp.rename(temp, target);
   }
 
-  const target = path.join(DATA_DIR, `${meta.code}.json`);
-  const temp = `${target}.${process.pid}.tmp`;
-  await fsp.writeFile(temp, JSON.stringify(meta, null, 2));
-  await fsp.rename(temp, target);
+  rememberMeta(meta);
+  invalidateRecordings();
 }
 
 async function saveRecording(meta, buffer) {
+  if (STORAGE_MODE === 'supabase') {
+    const key = supabaseAudioKey(meta);
+    await supabasePutObject(SUPABASE_MEDIA_BUCKET, key, buffer, {
+      contentType: meta.mime,
+      cacheControl: 'public, max-age=31536000, immutable',
+    });
+
+    meta.audioUrl = supabasePublicMediaUrl(key);
+
+    try {
+      await writeMeta(meta);
+    } catch (err) {
+      await supabaseDeleteObjects(SUPABASE_MEDIA_BUCKET, [key]).catch(() => {});
+      throw err;
+    }
+    return meta;
+  }
+
   if (STORAGE_MODE === 'blob') {
     const audio = await put(blobAudioPathname(meta), buffer, {
       access: 'public',
@@ -1214,6 +1552,21 @@ async function saveRecording(meta, buffer) {
 }
 
 async function removeRecording(meta) {
+  if (STORAGE_MODE === 'supabase') {
+    const results = await Promise.allSettled([
+      supabaseDeleteObjects(SUPABASE_DATA_BUCKET, [supabaseMetaKey(meta.code)]),
+      supabaseDeleteObjects(SUPABASE_MEDIA_BUCKET, [supabaseAudioKey(meta)]),
+    ]);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.warn(`Cleanup warning for ${meta.code}:`, result.reason && result.reason.message);
+      }
+    }
+    invalidateMetaCache(meta.code);
+    invalidateRecordings();
+    return;
+  }
+
   if (STORAGE_MODE === 'blob') {
     try {
       const versions = (await listAllBlobs(`${BLOB_META_PREFIX}${meta.code}.`))
@@ -1229,6 +1582,8 @@ async function removeRecording(meta) {
     } catch (err) {
       if (!isBlobMissing(err)) console.warn(`Cleanup warning for ${meta.code}:`, err.message);
     }
+    invalidateMetaCache(meta.code);
+    invalidateRecordings();
     return;
   }
 
@@ -1241,11 +1596,19 @@ async function removeRecording(meta) {
       console.warn(`Cleanup warning for ${meta.code}:`, result.reason.message);
     }
   }
+  invalidateMetaCache(meta.code);
+  invalidateRecordings();
 }
 
 async function allocateCode() {
   for (let attempt = 0; attempt < 25; attempt += 1) {
     const code = randomCode(8);
+
+    if (STORAGE_MODE === 'supabase') {
+      const existing = await supabaseHeadObject(SUPABASE_DATA_BUCKET, supabaseMetaKey(code));
+      if (!existing) return code;
+      continue;
+    }
 
     if (STORAGE_MODE === 'blob') {
       const existing = await list({
@@ -1264,6 +1627,20 @@ async function allocateCode() {
 
 async function sweepExpired() {
   if (STORAGE_MODE === 'unavailable') return;
+
+  if (STORAGE_MODE === 'supabase') {
+    const recordings = await listRecordings();
+    const now = Date.now();
+    for (const meta of recordings) {
+      if (!meta.expiresAt || Date.parse(meta.expiresAt) > now) continue;
+      try {
+        await removeRecording(meta);
+      } catch (err) {
+        console.warn(`Expiry cleanup warning for ${meta.code}:`, err.message);
+      }
+    }
+    return;
+  }
 
   if (STORAGE_MODE === 'blob') {
     const latest = [...(await latestMetaBlobs()).values()];
@@ -2078,7 +2455,7 @@ app.post('/api/logout', publicApiBlockGate, express.json({ limit: '2kb' }), (req
 function requireStorage(req, res, next) {
   if (STORAGE_MODE === 'unavailable') {
     res.status(503).json({
-      error: 'Storage is not connected. Add a Vercel Blob store to this project, then redeploy.',
+      error: 'Storage is not connected. Add a Supabase or Vercel Blob store to this project, then redeploy.',
     });
     return;
   }
@@ -2290,7 +2667,7 @@ app.get('/media/:code', publicMediaBlockGate, async (req, res, next) => {
     const meta = await getPlayableRecording(code);
     if (!meta || !isPubliclyVisible(meta)) throw httpError(404, 'Recording not found.');
 
-    if (STORAGE_MODE === 'blob') {
+    if (STORAGE_MODE === 'blob' || STORAGE_MODE === 'supabase') {
       if (!meta.audioUrl) throw httpError(404, 'Recording not found.');
       res.set('Cache-Control', 'public, max-age=300');
       res.redirect(302, meta.audioUrl);
@@ -2476,11 +2853,13 @@ app.get('/admin/dashboard', requireAdminConfigured, requireAdminSession, async (
     const status = ['deleted', 'missing', 'error'].includes(String(req.query.status || ''))
       ? String(req.query.status)
       : '';
-    const storageLabel = STORAGE_MODE === 'blob'
-      ? 'Vercel Blob'
-      : STORAGE_MODE === 'file'
-        ? 'Local disk'
-        : 'Not connected';
+    const storageLabel = STORAGE_MODE === 'supabase'
+      ? 'Supabase Storage'
+      : STORAGE_MODE === 'blob'
+        ? 'Vercel Blob'
+        : STORAGE_MODE === 'file'
+          ? 'Local disk'
+          : 'Not connected';
 
     sendAdminPage(res, 200, renderAdminDashboard({
       recordings,
@@ -2503,12 +2882,12 @@ app.get('/admin/audio/:code', requireAdminConfigured, async (req, res, next) => 
 
     const code = String(req.params.code);
     if (!CODE_PATTERN.test(code)) throw httpError(404, 'Recording not found.');
-    const meta = await readMeta(code);
+    const meta = await getPlayableRecording(code);
     if (!meta) throw httpError(404, 'Recording not found.');
     if (STORAGE_MODE === 'unavailable') throw httpError(503, 'Storage is not connected.');
 
     res.set('Cache-Control', 'private, no-store');
-    if (STORAGE_MODE === 'blob') {
+    if (STORAGE_MODE === 'blob' || STORAGE_MODE === 'supabase') {
       if (!meta.audioUrl) throw httpError(404, 'Recording not found.');
       let audioUrl;
       try {
@@ -2588,7 +2967,13 @@ app.get('/admin/screening', requireAdminConfigured, requireAdminSession, async (
       query,
       status,
       listError,
-      storageLabel: STORAGE_MODE === 'blob' ? 'Vercel Blob' : STORAGE_MODE === 'file' ? 'Local disk' : 'Not connected',
+      storageLabel: STORAGE_MODE === 'supabase'
+        ? 'Supabase Storage'
+        : STORAGE_MODE === 'blob'
+          ? 'Vercel Blob'
+          : STORAGE_MODE === 'file'
+            ? 'Local disk'
+            : 'Not connected',
     }), mediaOriginsFor(recordings));
   } catch (err) {
     next(err);
@@ -4219,11 +4604,13 @@ function startLocalServer() {
     console.log(`  ${APP_NAME} is running`);
     console.log(`  Local:    http://localhost:${activePort}`);
     if (lanIp) console.log(`  Network:  http://${lanIp}:${activePort}  <- use this address on your phone`);
-    const storageLabel = STORAGE_MODE === 'blob'
-      ? 'Vercel Blob'
-      : STORAGE_MODE === 'unavailable'
-        ? 'not configured (Blob store missing)'
-        : path.relative(APP_URL_PATH, DATA_DIR);
+    const storageLabel = STORAGE_MODE === 'supabase'
+      ? 'Supabase Storage'
+      : STORAGE_MODE === 'blob'
+        ? 'Vercel Blob'
+        : STORAGE_MODE === 'unavailable'
+          ? 'not configured (storage missing)'
+          : path.relative(APP_URL_PATH, DATA_DIR);
     console.log(`  Storage:  ${storageLabel}`);
     console.log(`  Retain:   ${RETENTION_DAYS > 0 ? `${RETENTION_DAYS} days` : 'until deleted'}`);
     if (ADMIN_CONFIGURED) {
